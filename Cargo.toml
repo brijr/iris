@@ -2,7 +2,13 @@
 name = "snap"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Minimal, powerful screenshots of live websites"
+license = "MIT"
+repository = "https://github.com/brijr/snap"
+readme = "README.md"
+keywords = ["screenshot", "cli", "chrome", "headless", "web"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1"

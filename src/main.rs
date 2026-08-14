@@ -15,7 +15,16 @@ use url::Url;
 /// Screenshot live websites. Minimal interface, powerful engine:
 /// smart waiting, lazy-load handling, retina output, concurrent capture.
 #[derive(Parser)]
-#[command(name = "snap", version, arg_required_else_help = true)]
+#[command(
+    name = "snap",
+    version,
+    arg_required_else_help = true,
+    after_help = "\
+Examples:
+  snap example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
+  snap --full --dark tailwindcss.com    full page, dark color scheme
+  cat urls.txt | snap - -o shots/       concurrent batch from stdin"
+)]
 struct Cli {
     /// URLs to capture; `-` reads newline-separated URLs from stdin
     #[arg(required = true, value_name = "URL")]
@@ -36,6 +45,10 @@ struct Cli {
     /// Emulate prefers-color-scheme: dark
     #[arg(long)]
     dark: bool,
+
+    /// Image format (a recognized --out file extension wins) [default: png]
+    #[arg(long, value_parser = ["png", "jpg", "jpeg", "webp"], value_name = "FMT")]
+    format: Option<String>,
 
     /// Extra settle delay in ms after smart waiting
     #[arg(long, default_value_t = 0, value_name = "MS")]
@@ -68,7 +81,8 @@ async fn main() -> Result<()> {
 
     let urls = collect_urls(&cli.urls)?;
     let viewport = parse_size(&cli.size, cli.scale)?;
-    let targets = resolve_outputs(&urls, cli.out.as_deref()).await?;
+    let flag_format = cli.format.as_deref().and_then(Format::from_ext);
+    let (targets, format) = resolve_outputs(&urls, cli.out.as_deref(), flag_format).await?;
     let jobs = cli.jobs.unwrap_or_else(|| urls.len().min(4)).max(1);
 
     let opts = Arc::new(Opts {
@@ -78,11 +92,7 @@ async fn main() -> Result<()> {
         wait_ms: cli.wait,
         wait_for: cli.wait_for,
         timeout: Duration::from_secs(cli.timeout.max(1)),
-        format: targets
-            .first()
-            .and_then(|(_, p)| p.extension())
-            .and_then(|e| Format::from_ext(&e.to_string_lossy()))
-            .unwrap_or(Format::Png),
+        format,
     });
 
     let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
@@ -155,7 +165,11 @@ fn collect_urls(args: &[String]) -> Result<Vec<Url>> {
     }
     raw.iter()
         .map(|s| {
-            let s = if s.contains("://") { s.clone() } else { format!("https://{s}") };
+            let s = if s.contains("://") {
+                s.clone()
+            } else {
+                format!("https://{s}")
+            };
             Url::parse(&s).with_context(|| format!("invalid URL: {s}"))
         })
         .collect()
@@ -171,31 +185,44 @@ fn parse_size(size: &str, scale: Option<f64>) -> Result<Viewport> {
                 .split_once(['x', 'X'])
                 .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                 .with_context(|| {
-                    format!("invalid --size {custom:?}: use WxH (e.g. 1440x900) or desktop|iphone|ipad")
+                    format!(
+                        "invalid --size {custom:?}: use WxH (e.g. 1440x900) or desktop|iphone|ipad"
+                    )
                 })?;
             (w, h, 2.0, false)
         }
     };
-    Ok(Viewport { width, height, scale: scale.unwrap_or(preset_scale), mobile })
+    Ok(Viewport {
+        width,
+        height,
+        scale: scale.unwrap_or(preset_scale),
+        mobile,
+    })
 }
 
-/// Pair each URL with its output path. Single URL + `--out file.ext` writes that exact
-/// file; anything else treats --out (default `.`) as a directory of derived names.
-async fn resolve_outputs(urls: &[Url], out: Option<&std::path::Path>) -> Result<Vec<(Url, PathBuf)>> {
+/// Pair each URL with its output path and settle the image format. Single URL +
+/// `--out file.ext` writes that exact file (its extension beats --format); anything
+/// else treats --out (default `.`) as a directory of derived names in the chosen format.
+async fn resolve_outputs(
+    urls: &[Url],
+    out: Option<&std::path::Path>,
+    flag_format: Option<Format>,
+) -> Result<(Vec<(Url, PathBuf)>, Format)> {
     if let (1, Some(path)) = (urls.len(), out)
         && let Some(ext) = path.extension()
-        && Format::from_ext(&ext.to_string_lossy()).is_some()
+        && let Some(format) = Format::from_ext(&ext.to_string_lossy())
     {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(dir).await?;
         }
-        return Ok(vec![(urls[0].clone(), path.to_path_buf())]);
+        return Ok((vec![(urls[0].clone(), path.to_path_buf())], format));
     }
 
+    let format = flag_format.unwrap_or(Format::Png);
     let dir = out.unwrap_or_else(|| std::path::Path::new("."));
     tokio::fs::create_dir_all(dir).await?;
     let mut seen: HashMap<String, u32> = HashMap::new();
-    Ok(urls
+    let targets = urls
         .iter()
         .map(|url| {
             let mut name = derived_name(url);
@@ -204,18 +231,29 @@ async fn resolve_outputs(urls: &[Url], out: Option<&std::path::Path>) -> Result<
             if *n > 1 {
                 name = format!("{name}-{n}");
             }
-            (url.clone(), dir.join(format!("{name}.png")))
+            (url.clone(), dir.join(format!("{name}.{}", format.ext())))
         })
-        .collect())
+        .collect();
+    Ok((targets, format))
 }
 
 /// `https://example.com/pricing/` -> `example.com-pricing`
 fn derived_name(url: &Url) -> String {
     let host = url.host_str().unwrap_or("page");
     let path = url.path().trim_matches('/').replace('/', "-");
-    let name = if path.is_empty() { host.to_string() } else { format!("{host}-{path}") };
+    let name = if path.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}-{path}")
+    };
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

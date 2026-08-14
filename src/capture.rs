@@ -42,6 +42,14 @@ impl Format {
         }
     }
 
+    pub fn ext(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Webp => "webp",
+        }
+    }
+
     fn cdp(self) -> CaptureScreenshotFormat {
         match self {
             Self::Png => CaptureScreenshotFormat::Png,
@@ -103,7 +111,11 @@ impl Session {
             .await
             .ok()
             .map(|v| v.user_agent.replace("HeadlessChrome", "Chrome"));
-        Ok(Self { browser, handler, user_agent })
+        Ok(Self {
+            browser,
+            handler,
+            user_agent,
+        })
     }
 
     pub async fn capture(&self, url: &str, out: &Path, opts: &Opts) -> Result<Shot> {
@@ -132,7 +144,11 @@ impl Session {
         )
         .await?;
 
-        let ua = if v.mobile { Some(IPHONE_UA.to_string()) } else { self.user_agent.clone() };
+        let ua = if v.mobile {
+            Some(IPHONE_UA.to_string())
+        } else {
+            self.user_agent.clone()
+        };
         if let Some(ua) = ua {
             page.execute(
                 SetUserAgentOverrideParams::builder()
@@ -166,7 +182,8 @@ impl Session {
                 .timeout
                 .saturating_sub(started.elapsed())
                 .saturating_sub(Duration::from_millis(500));
-            self.eval(page, wait_for_js(selector, budget.as_millis() as u64)).await?;
+            self.eval(page, wait_for_js(selector, budget.as_millis() as u64))
+                .await?;
         }
         if opts.full {
             self.eval(page, SCROLL_JS.into()).await?;
@@ -203,7 +220,11 @@ impl Session {
                 self.eval(page, SETTLE_JS.into()).await?;
                 (doc_h, v.scale, page.screenshot(params.build()).await?)
             } else {
-                (doc_h, 1.0, page.screenshot(params.full_page(true).build()).await?)
+                (
+                    doc_h,
+                    1.0,
+                    page.screenshot(params.full_page(true).build()).await?,
+                )
             }
         } else {
             (v.height, v.scale, page.screenshot(params.build()).await?)
@@ -213,7 +234,11 @@ impl Session {
         tokio::fs::write(out, data)
             .await
             .with_context(|| format!("failed to write {}", out.display()))?;
-        Ok(Shot { height, scale, bytes })
+        Ok(Shot {
+            height,
+            scale,
+            bytes,
+        })
     }
 
     /// Run a JS expression (promises awaited); surface page-side exceptions as errors.
@@ -233,7 +258,12 @@ impl Session {
                 .unwrap_or_else(|| details.text.clone());
             bail!("{}", msg.lines().next().unwrap_or("page script failed"));
         }
-        Ok(resp.result.result.value.clone().unwrap_or(serde_json::Value::Null))
+        Ok(resp
+            .result
+            .result
+            .value
+            .clone()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     async fn eval_u32(&self, page: &Page, js: &str) -> Result<u32> {
@@ -268,7 +298,13 @@ fn find_chrome() -> Option<PathBuf> {
         "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
     ];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    const CANDIDATES: &[&str] = &[
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    ];
+    #[cfg(not(any(target_os = "macos", windows)))]
     const CANDIDATES: &[&str] = &[
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
