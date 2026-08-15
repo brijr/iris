@@ -313,16 +313,24 @@ fn find_chrome() -> Option<PathBuf> {
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Fonts loaded, images loaded (5s cap each), two frames painted, then any
-/// running finite animations/transitions — entrance fade-ins — allowed to
-/// finish (3s cap; infinite loops are skipped, they never settle).
+/// Fonts loaded, near-viewport images loaded (3s cap each), two frames painted,
+/// then any running finite animations/transitions — entrance fade-ins — allowed
+/// to finish (3s cap; infinite loops are skipped, they never settle). Off-screen
+/// images are ignored: they don't appear in the capture, and lazy-loaded ones
+/// would stall the wait forever. Full-page captures grow the viewport to the
+/// whole document before the final settle, so everything counts as near there.
 const SETTLE_JS: &str = r#"(async () => {
   if (document.fonts) { try { await document.fonts.ready; } catch {} }
-  await Promise.all(Array.from(document.images, img => img.complete ? 0 :
-    new Promise(r => {
+  const near = (img) => {
+    const r = img.getBoundingClientRect();
+    return r.top < innerHeight * 1.5 && r.bottom > -innerHeight * 0.5;
+  };
+  await Promise.all(Array.from(document.images)
+    .filter(img => !img.complete && near(img))
+    .map(img => new Promise(r => {
       img.addEventListener('load', r, { once: true });
       img.addEventListener('error', r, { once: true });
-      setTimeout(r, 5000);
+      setTimeout(r, 3000);
     })));
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
   const finite = document.getAnimations().filter(a => {
