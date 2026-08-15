@@ -28,7 +28,7 @@ The only runtime dependency is an installed Chrome-family browser (Chrome, Chrom
 ## What it does for you
 
 - Renders with your real installed Chrome, driven over the DevTools Protocol
-- Waits for fonts, paint frames, and — on `--full` — scroll-triggers lazy-loaded content before capturing
+- Waits for fonts, image loads, entrance animations, and — on `--full` — scroll-triggers lazy-loaded content before capturing
 - Retina `@2x` output by default; full pages taller than Chrome's ~16k px render limit fall back to `@1x` automatically (the report tells you which you got)
 - Image format from the `-o` extension or `--format`: `png` (default), `jpg`, `webp` (JPEG/WebP encode at quality 90)
 - One browser process, concurrent tabs; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)

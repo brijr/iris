@@ -313,9 +313,27 @@ fn find_chrome() -> Option<PathBuf> {
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Fonts loaded + two animation frames painted.
+/// Fonts loaded, images loaded (5s cap each), two frames painted, then any
+/// running finite animations/transitions — entrance fade-ins — allowed to
+/// finish (3s cap; infinite loops are skipped, they never settle).
 const SETTLE_JS: &str = r#"(async () => {
   if (document.fonts) { try { await document.fonts.ready; } catch {} }
+  await Promise.all(Array.from(document.images, img => img.complete ? 0 :
+    new Promise(r => {
+      img.addEventListener('load', r, { once: true });
+      img.addEventListener('error', r, { once: true });
+      setTimeout(r, 5000);
+    })));
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const finite = document.getAnimations().filter(a => {
+    try {
+      return a.playState === 'running' && a.effect.getTiming().iterations !== Infinity;
+    } catch { return false; }
+  });
+  await Promise.race([
+    Promise.all(finite.map(a => a.finished.catch(() => {}))),
+    new Promise(r => setTimeout(r, 3000)),
+  ]);
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 })()"#;
 
