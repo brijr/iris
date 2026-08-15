@@ -962,6 +962,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "shot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chromiumoxide",
+ "clap",
+ "futures",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -982,19 +995,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "snap"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chromiumoxide",
- "clap",
- "futures",
- "serde_json",
- "tokio",
- "url",
-]
 
 [[package]]
 name = "socket2"

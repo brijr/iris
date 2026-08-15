@@ -1,10 +1,10 @@
 #!/bin/sh
-# snap installer — https://github.com/brijr/snap
-# usage: curl -fsSL https://raw.githubusercontent.com/brijr/snap/main/install.sh | sh
+# shot installer — https://github.com/brijr/shot
+# usage: curl -fsSL https://raw.githubusercontent.com/brijr/shot/main/install.sh | sh
 set -eu
 
-REPO="brijr/snap"
-DIR="${SNAP_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="brijr/shot"
+DIR="${SHOT_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64)          TARGET="aarch64-apple-darwin" ;;
@@ -17,12 +17,12 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 
-URL="https://github.com/$REPO/releases/latest/download/snap-$TARGET.tar.gz"
-echo "downloading snap ($TARGET)…"
+URL="https://github.com/$REPO/releases/latest/download/shot-$TARGET.tar.gz"
+echo "downloading shot ($TARGET)…"
 mkdir -p "$DIR"
 curl -fsSL "$URL" | tar -xz -C "$DIR"
-chmod +x "$DIR/snap"
-echo "installed $("$DIR/snap" --version) → $DIR/snap"
+chmod +x "$DIR/shot"
+echo "installed $("$DIR/shot" --version) → $DIR/shot"
 
 case ":$PATH:" in
   *":$DIR:"*) ;;

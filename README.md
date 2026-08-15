@@ -1,26 +1,26 @@
-# snap
+# shot
 
 Screenshots of live websites. Minimal interface, powerful engine.
 
 ```
-snap example.com                        # 1440×900 @2x → example.com.png
-snap --full --dark tailwindcss.com      # full page, dark color scheme
-snap --size iphone stripe.com           # 390×844 @3x with a mobile UA
-snap -o shots/ a.com b.com c.com        # batch, captured concurrently
-cat urls.txt | snap - -o shots/         # batch from stdin (# comments ok)
-snap -o hero.jpg --wait-for 'h1' app.dev
+shot example.com                        # 1440×900 @2x → example.com.png
+shot --full --dark tailwindcss.com      # full page, dark color scheme
+shot --size iphone stripe.com           # 390×844 @3x with a mobile UA
+shot -o shots/ a.com b.com c.com        # batch, captured concurrently
+cat urls.txt | shot - -o shots/         # batch from stdin (# comments ok)
+shot -o hero.jpg --wait-for 'h1' app.dev
 ```
 
 ## Install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/brijr/snap/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/brijr/shot/main/install.sh | sh
 ```
 
 Or with a Rust toolchain:
 
 ```
-cargo install --git https://github.com/brijr/snap
+cargo install --git https://github.com/brijr/shot
 ```
 
 The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, or Brave).
