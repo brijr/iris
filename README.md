@@ -11,6 +11,10 @@ cat urls.txt | shot - -o shots/         # batch from stdin (# comments ok)
 shot -o hero.jpg --wait-for 'h1' app.dev
 ```
 
+`shot --full bridger.to` →
+
+![Full-page capture of bridger.to, taken by shot](.github/demo.png)
+
 ## Install
 
 ```
