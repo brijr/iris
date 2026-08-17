@@ -27,11 +27,11 @@ jobs:
       - if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: tar -C target/${{ matrix.target }}/release -czf shot-${{ matrix.target }}.tar.gz shot
+      - run: tar -C target/${{ matrix.target }}/release -czf iris-${{ matrix.target }}.tar.gz iris
       - uses: actions/upload-artifact@v4
         with:
-          name: shot-${{ matrix.target }}
-          path: shot-${{ matrix.target }}.tar.gz
+          name: iris-${{ matrix.target }}
+          path: iris-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -42,5 +42,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: shot-*.tar.gz
+          files: iris-*.tar.gz
           generate_release_notes: true

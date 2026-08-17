@@ -16,14 +16,14 @@ use url::Url;
 /// smart waiting, lazy-load handling, retina output, concurrent capture.
 #[derive(Parser)]
 #[command(
-    name = "shot",
+    name = "iris",
     version,
     arg_required_else_help = true,
     after_help = "\
 Examples:
-  shot example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
-  shot --full --dark tailwindcss.com    full page, dark color scheme
-  cat urls.txt | shot - -o shots/       concurrent batch from stdin"
+  iris example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
+  iris --full --dark tailwindcss.com    full page, dark color scheme
+  cat urls.txt | iris - -o shots/       concurrent batch from stdin"
 )]
 struct Cli {
     /// URLs to capture; `-` reads newline-separated URLs from stdin

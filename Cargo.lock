@@ -656,6 +656,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
+name = "iris"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chromiumoxide",
+ "clap",
+ "futures",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -959,19 +972,6 @@ dependencies = [
  "cfg-if",
  "cpufeatures",
  "digest",
-]
-
-[[package]]
-name = "shot"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "chromiumoxide",
- "clap",
- "futures",
- "serde_json",
- "tokio",
- "url",
 ]
 
 [[package]]

@@ -1,30 +1,30 @@
-# shot
+# iris
 
 Screenshots of live websites. Minimal interface, powerful engine.
 
 ```
-shot example.com                        # 1440×900 @2x → example.com.png
-shot --full --dark tailwindcss.com      # full page, dark color scheme
-shot --size iphone stripe.com           # 390×844 @3x with a mobile UA
-shot -o shots/ a.com b.com c.com        # batch, captured concurrently
-cat urls.txt | shot - -o shots/         # batch from stdin (# comments ok)
-shot -o hero.jpg --wait-for 'h1' app.dev
+iris example.com                        # 1440×900 @2x → example.com.png
+iris --full --dark tailwindcss.com      # full page, dark color scheme
+iris --size iphone stripe.com           # 390×844 @3x with a mobile UA
+iris -o shots/ a.com b.com c.com        # batch, captured concurrently
+cat urls.txt | iris - -o shots/         # batch from stdin (# comments ok)
+iris -o hero.jpg --wait-for 'h1' app.dev
 ```
 
-`shot --full bridger.to` →
+`iris --full bridger.to` →
 
-![Full-page capture of bridger.to, taken by shot](.github/demo.png)
+![Full-page capture of bridger.to, taken by iris](.github/demo.png)
 
 ## Install
 
 ```
-curl -fsSL https://raw.githubusercontent.com/brijr/shot/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/brijr/iris/main/install.sh | sh
 ```
 
 Or with a Rust toolchain:
 
 ```
-cargo install --git https://github.com/brijr/shot
+cargo install --git https://github.com/brijr/iris
 ```
 
 The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, or Brave).
