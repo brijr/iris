@@ -26,8 +26,10 @@ curl -fsSL https://raw.githubusercontent.com/brijr/iris/main/install.sh | sh
 Or with a Rust toolchain:
 
 ```
-cargo install --git https://github.com/brijr/iris
+cargo install iris-screenshot
 ```
+
+The crates.io package is named `iris-screenshot`; the installed command is `iris`.
 
 The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, or Brave).
 

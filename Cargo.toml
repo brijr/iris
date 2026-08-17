@@ -1,6 +1,6 @@
 [package]
-name = "iris"
-version = "0.3.0"
+name = "iris-screenshot"
+version = "0.3.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Minimal, powerful screenshots of live websites"
@@ -9,6 +9,10 @@ repository = "https://github.com/brijr/iris"
 readme = "README.md"
 keywords = ["screenshot", "cli", "chrome", "headless", "web"]
 categories = ["command-line-utilities"]
+
+[[bin]]
+name = "iris"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
