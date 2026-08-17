@@ -7,11 +7,14 @@ use chromiumoxide::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
     SetUserAgentOverrideParams,
 };
-use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use chromiumoxide::cdp::browser_protocol::page::{
+    CaptureScreenshotFormat, Viewport as ScreenshotViewport,
+};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
+use serde::Deserialize;
 use tokio::task::JoinHandle;
 
 const IPHONE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) \
@@ -59,9 +62,40 @@ impl Format {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureMode {
+    Viewport,
+    FullPage,
+    Element { selector: String, padding: u32 },
+}
+
+impl CaptureMode {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Viewport => "viewport",
+            Self::FullPage => "full_page",
+            Self::Element { .. } => "element",
+        }
+    }
+
+    pub fn selector(&self) -> Option<&str> {
+        match self {
+            Self::Element { selector, .. } => Some(selector),
+            _ => None,
+        }
+    }
+
+    pub fn padding(&self) -> Option<u32> {
+        match self {
+            Self::Element { padding, .. } => Some(*padding),
+            _ => None,
+        }
+    }
+}
+
 pub struct Opts {
     pub viewport: Viewport,
-    pub full: bool,
+    pub mode: CaptureMode,
     pub dark: bool,
     pub wait_ms: u64,
     pub wait_for: Option<String>,
@@ -69,13 +103,33 @@ pub struct Opts {
     pub format: Format,
 }
 
+#[derive(Debug)]
 pub struct Shot {
-    /// Captured page height in CSS pixels (viewport height, or document height when full).
+    /// Captured width and height in CSS pixels.
+    pub width: u32,
     pub height: u32,
     /// Device scale factor actually used (full-page shots too tall for Chrome's
     /// ~16k texture limit fall back to 1x).
     pub scale: f64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ElementBounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    doc_width: f64,
+    doc_height: f64,
+}
+
+#[derive(Debug, PartialEq)]
+struct ClipRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 pub struct Session {
@@ -185,49 +239,109 @@ impl Session {
             self.eval(page, wait_for_js(selector, budget.as_millis() as u64))
                 .await?;
         }
-        if opts.full {
-            self.eval(page, SCROLL_JS.into()).await?;
+        match &opts.mode {
+            CaptureMode::Viewport => {}
+            CaptureMode::FullPage => {
+                self.eval(page, SCROLL_JS.into()).await?;
+            }
+            CaptureMode::Element { selector, .. } => {
+                let budget = opts
+                    .timeout
+                    .saturating_sub(started.elapsed())
+                    .saturating_sub(Duration::from_millis(500));
+                self.eval(
+                    page,
+                    wait_and_scroll_js(selector, budget.as_millis() as u64),
+                )
+                .await?;
+                // Scrolling can start image loads, IntersectionObservers, and
+                // entrance transitions that the initial settle could not see.
+                self.eval(page, SETTLE_JS.into()).await?;
+            }
         }
         if opts.wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(opts.wait_ms)).await;
             self.eval(page, SETTLE_JS.into()).await?;
         }
 
-        let mut params = ScreenshotParams::builder().format(opts.format.cdp());
-        if opts.format != Format::Png {
-            params = params.quality(90);
-        }
+        let screenshot_params = || {
+            let mut params = ScreenshotParams::builder().format(opts.format.cdp());
+            if opts.format != Format::Png {
+                params = params.quality(90);
+            }
+            params
+        };
 
-        let (height, scale, data) = if opts.full {
-            let doc_h = self
-                .eval_u32(page, DOC_HEIGHT_JS)
-                .await
-                .unwrap_or(v.height)
-                .max(v.height);
-            if doc_h as f64 * v.scale <= 16_000.0 {
-                // Retina full page: grow the viewport to the whole document so the
-                // scale factor still applies (CDP's captureBeyondViewport renders at 1x).
-                page.execute(
-                    SetDeviceMetricsOverrideParams::builder()
-                        .width(v.width as i64)
-                        .height(doc_h as i64)
-                        .device_scale_factor(v.scale)
-                        .mobile(v.mobile)
-                        .build()
-                        .map_err(|e| anyhow!(e))?,
-                )
-                .await?;
-                self.eval(page, SETTLE_JS.into()).await?;
-                (doc_h, v.scale, page.screenshot(params.build()).await?)
-            } else {
+        let (width, height, scale, data) = match &opts.mode {
+            CaptureMode::Viewport => (
+                v.width,
+                v.height,
+                v.scale,
+                page.screenshot(screenshot_params().build()).await?,
+            ),
+            CaptureMode::FullPage => {
+                let doc_h = self
+                    .eval_u32(page, DOC_HEIGHT_JS)
+                    .await
+                    .unwrap_or(v.height)
+                    .max(v.height);
+                if doc_h as f64 * v.scale <= 16_000.0 {
+                    // Retina full page: grow the viewport to the whole document so the
+                    // scale factor still applies (CDP's captureBeyondViewport renders at 1x).
+                    page.execute(
+                        SetDeviceMetricsOverrideParams::builder()
+                            .width(v.width as i64)
+                            .height(doc_h as i64)
+                            .device_scale_factor(v.scale)
+                            .mobile(v.mobile)
+                            .build()
+                            .map_err(|e| anyhow!(e))?,
+                    )
+                    .await?;
+                    self.eval(page, SETTLE_JS.into()).await?;
+                    (
+                        v.width,
+                        doc_h,
+                        v.scale,
+                        page.screenshot(screenshot_params().build()).await?,
+                    )
+                } else {
+                    (
+                        v.width,
+                        doc_h,
+                        1.0,
+                        page.screenshot(screenshot_params().full_page(true).build())
+                            .await?,
+                    )
+                }
+            }
+            CaptureMode::Element { selector, padding } => {
+                let value = self.eval(page, element_bounds_js(selector)).await?;
+                let bounds: ElementBounds = serde_json::from_value(value)
+                    .context("failed to read selected element bounds")?;
+                let clip = round_clip(&bounds, *padding)
+                    .with_context(|| format!("cannot capture selected element: {selector}"))?;
+                let cdp_clip = ScreenshotViewport::builder()
+                    .x(clip.x)
+                    .y(clip.y)
+                    .width(clip.width)
+                    .height(clip.height)
+                    .scale(1.0)
+                    .build()
+                    .map_err(|e| anyhow!(e))?;
                 (
-                    doc_h,
-                    1.0,
-                    page.screenshot(params.full_page(true).build()).await?,
+                    clip.width as u32,
+                    clip.height as u32,
+                    v.scale,
+                    page.screenshot(
+                        screenshot_params()
+                            .clip(cdp_clip)
+                            .capture_beyond_viewport(true)
+                            .build(),
+                    )
+                    .await?,
                 )
             }
-        } else {
-            (v.height, v.scale, page.screenshot(params.build()).await?)
         };
 
         let bytes = data.len() as u64;
@@ -235,6 +349,7 @@ impl Session {
             .await
             .with_context(|| format!("failed to write {}", out.display()))?;
         Ok(Shot {
+            width,
             height,
             scale,
             bytes,
@@ -367,13 +482,312 @@ const DOC_HEIGHT_JS: &str = r#"Math.max(
 )"#;
 
 fn wait_for_js(selector: &str, budget_ms: u64) -> String {
+    let selector = serde_json::to_string(selector).expect("selector is serializable");
     format!(
         r#"(async () => {{
   const deadline = Date.now() + {budget_ms};
-  while (!document.querySelector({selector:?})) {{
-    if (Date.now() > deadline) throw new Error("selector never appeared: " + {selector:?});
+  const selector = {selector};
+  const find = () => {{
+    try {{ return document.querySelector(selector); }}
+    catch {{ throw new Error("invalid selector: " + selector); }}
+  }};
+  while (!find()) {{
+    if (Date.now() >= deadline) throw new Error("selector never appeared: " + selector);
     await new Promise(r => setTimeout(r, 100));
   }}
 }})()"#
     )
+}
+
+fn wait_and_scroll_js(selector: &str, budget_ms: u64) -> String {
+    let selector = serde_json::to_string(selector).expect("selector is serializable");
+    format!(
+        r#"(async () => {{
+  const deadline = Date.now() + {budget_ms};
+  const selector = {selector};
+  const find = () => {{
+    try {{ return document.querySelector(selector); }}
+    catch {{ throw new Error("invalid selector: " + selector); }}
+  }};
+  let element;
+  while (!(element = find())) {{
+    if (Date.now() >= deadline) throw new Error("selector never appeared: " + selector);
+    await new Promise(r => setTimeout(r, 100));
+  }}
+  element.scrollIntoView({{ block: "center", inline: "center" }});
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+}})()"#
+    )
+}
+
+fn element_bounds_js(selector: &str) -> String {
+    let selector = serde_json::to_string(selector).expect("selector is serializable");
+    format!(
+        r#"(() => {{
+  const selector = {selector};
+  let element;
+  try {{ element = document.querySelector(selector); }}
+  catch {{ throw new Error("invalid selector: " + selector); }}
+  if (!element) throw new Error("selector disappeared: " + selector);
+  const rect = element.getBoundingClientRect();
+  if (![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite) ||
+      rect.width <= 0 || rect.height <= 0) {{
+    throw new Error("element has no rendered size: " + selector);
+  }}
+  return {{
+    x: rect.left + window.scrollX,
+    y: rect.top + window.scrollY,
+    width: rect.width,
+    height: rect.height,
+    doc_width: Math.max(
+      document.body?.scrollWidth ?? 0,
+      document.documentElement.scrollWidth,
+      document.documentElement.clientWidth
+    ),
+    doc_height: Math.max(
+      document.body?.scrollHeight ?? 0,
+      document.documentElement.scrollHeight,
+      document.documentElement.clientHeight
+    )
+  }};
+}})()"#
+    )
+}
+
+fn round_clip(bounds: &ElementBounds, padding: u32) -> Result<ClipRect> {
+    let padding = padding as f64;
+    let left = (bounds.x - padding).floor().clamp(0.0, bounds.doc_width);
+    let top = (bounds.y - padding).floor().clamp(0.0, bounds.doc_height);
+    let right = (bounds.x + bounds.width + padding)
+        .ceil()
+        .clamp(0.0, bounds.doc_width);
+    let bottom = (bounds.y + bounds.height + padding)
+        .ceil()
+        .clamp(0.0, bounds.doc_height);
+
+    if ![left, top, right, bottom].iter().all(|n| n.is_finite()) {
+        bail!("selected element returned invalid bounds");
+    }
+    if right <= left || bottom <= top {
+        bail!("selected element is outside the document bounds");
+    }
+
+    Ok(ClipRect {
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_rounds_outward_and_applies_padding() {
+        let clip = round_clip(
+            &ElementBounds {
+                x: 10.25,
+                y: 20.75,
+                width: 100.5,
+                height: 50.5,
+                doc_width: 200.0,
+                doc_height: 200.0,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            clip,
+            ClipRect {
+                x: 5.0,
+                y: 15.0,
+                width: 111.0,
+                height: 62.0,
+            }
+        );
+    }
+
+    #[test]
+    fn clip_clamps_to_each_document_edge() {
+        let top_left = round_clip(
+            &ElementBounds {
+                x: 1.2,
+                y: 1.2,
+                width: 20.2,
+                height: 30.2,
+                doc_width: 200.0,
+                doc_height: 200.0,
+            },
+            10,
+        )
+        .unwrap();
+        assert_eq!(
+            top_left,
+            ClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 42.0,
+            }
+        );
+
+        let bottom_right = round_clip(
+            &ElementBounds {
+                x: 190.4,
+                y: 180.4,
+                width: 20.0,
+                height: 30.0,
+                doc_width: 200.0,
+                doc_height: 200.0,
+            },
+            5,
+        )
+        .unwrap();
+        assert_eq!(
+            bottom_right,
+            ClipRect {
+                x: 185.0,
+                y: 175.0,
+                width: 15.0,
+                height: 25.0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_element_capture_contract() -> Result<()> {
+        let temp = std::env::temp_dir().join(format!("iris-browser-{}", std::process::id()));
+        tokio::fs::create_dir_all(&temp).await?;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/precise-capture.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 1.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+
+        let one_x_path = temp.join("target-1x.png");
+        let one_x = session
+            .capture(
+                url.as_str(),
+                &one_x_path,
+                &element_opts(viewport, ".capture-target", 10, Format::Png),
+            )
+            .await?;
+        // The first duplicate starts at 80.5px and transitions to 120.5px only
+        // after scrolling into view. The final 141x81 frame proves first-match,
+        // automatic scroll/settle, outward rounding, and padding together.
+        assert_eq!((one_x.width, one_x.height), (141, 81));
+        assert_eq!(
+            png_dimensions(&tokio::fs::read(&one_x_path).await?),
+            (141, 81)
+        );
+
+        let two_x_viewport = Viewport {
+            scale: 2.0,
+            ..viewport
+        };
+        let two_x_path = temp.join("target-2x.png");
+        let two_x = session
+            .capture(
+                url.as_str(),
+                &two_x_path,
+                &element_opts(two_x_viewport, ".capture-target", 10, Format::Png),
+            )
+            .await?;
+        assert_eq!((two_x.width, two_x.height), (141, 81));
+        assert_eq!(
+            png_dimensions(&tokio::fs::read(&two_x_path).await?),
+            (282, 162)
+        );
+
+        let jpeg_path = temp.join("target.jpg");
+        session
+            .capture(
+                url.as_str(),
+                &jpeg_path,
+                &element_opts(viewport, ".capture-target", 0, Format::Jpeg),
+            )
+            .await?;
+        let jpeg = tokio::fs::read(&jpeg_path).await?;
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
+
+        let webp_path = temp.join("target.webp");
+        session
+            .capture(
+                url.as_str(),
+                &webp_path,
+                &element_opts(viewport, ".capture-target", 0, Format::Webp),
+            )
+            .await?;
+        let webp = tokio::fs::read(&webp_path).await?;
+        assert_eq!(&webp[..4], b"RIFF");
+        assert_eq!(&webp[8..12], b"WEBP");
+
+        let invalid = session
+            .capture(
+                url.as_str(),
+                &temp.join("invalid.png"),
+                &element_opts(viewport, "[", 0, Format::Png),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{invalid:#}").contains("invalid selector: ["));
+
+        let mut missing_url = url.clone();
+        missing_url.set_query(Some("missing=1"));
+        let missing = session
+            .capture(
+                missing_url.as_str(),
+                &temp.join("missing.png"),
+                &element_opts(viewport, ".capture-target", 0, Format::Png),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{missing:#}").contains("selector never appeared: .capture-target"));
+
+        let zero = session
+            .capture(
+                url.as_str(),
+                &temp.join("zero.png"),
+                &element_opts(viewport, "#zero-size", 0, Format::Png),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{zero:#}").contains("element has no rendered size: #zero-size"));
+
+        session.close().await;
+        tokio::fs::remove_dir_all(temp).await?;
+        Ok(())
+    }
+
+    fn element_opts(viewport: Viewport, selector: &str, padding: u32, format: Format) -> Opts {
+        Opts {
+            viewport,
+            mode: CaptureMode::Element {
+                selector: selector.into(),
+                padding,
+            },
+            dark: false,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(3),
+            format,
+        }
+    }
+
+    fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        )
+    }
 }

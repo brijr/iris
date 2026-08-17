@@ -7,9 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use capture::{Format, Opts, Session, Viewport};
+use capture::{CaptureMode, Format, Opts, Session, Shot, Viewport};
 use clap::Parser;
 use futures::StreamExt;
+use serde::Serialize;
 use url::Url;
 
 /// Screenshot live websites. Minimal interface, powerful engine:
@@ -23,6 +24,7 @@ use url::Url;
 Examples:
   iris example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
   iris --full --dark tailwindcss.com    full page, dark color scheme
+  iris --selector '#hero' --padding 24 app.dev
   cat urls.txt | iris - -o shots/       concurrent batch from stdin"
 )]
 struct Cli {
@@ -41,6 +43,14 @@ struct Cli {
     /// Capture the full page height
     #[arg(long)]
     full: bool,
+
+    /// Capture the first element matching this CSS selector
+    #[arg(long, value_name = "CSS", conflicts_with = "full")]
+    selector: Option<String>,
+
+    /// Uniform CSS-pixel padding around a selected element
+    #[arg(long, value_name = "PX", requires = "selector")]
+    padding: Option<u32>,
 
     /// Emulate prefers-color-scheme: dark
     #[arg(long)]
@@ -73,6 +83,40 @@ struct Cli {
     /// Chrome/Chromium binary [auto-detected]
     #[arg(long, env = "CHROME", value_name = "PATH")]
     chrome: Option<PathBuf>,
+
+    /// Emit one JSON object per completed capture
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Serialize)]
+struct SuccessReport<'a> {
+    status: &'static str,
+    url: &'a str,
+    output: String,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    padding: Option<u32>,
+    css_width: u32,
+    css_height: u32,
+    scale: f64,
+    format: &'static str,
+    bytes: u64,
+}
+
+#[derive(Serialize)]
+struct ErrorReport<'a> {
+    status: &'static str,
+    url: &'a str,
+    output: String,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    padding: Option<u32>,
+    error: String,
 }
 
 #[tokio::main]
@@ -81,13 +125,14 @@ async fn main() -> Result<()> {
 
     let urls = collect_urls(&cli.urls)?;
     let viewport = parse_size(&cli.size, cli.scale)?;
+    let mode = capture_mode(&cli);
     let flag_format = cli.format.as_deref().and_then(Format::from_ext);
     let (targets, format) = resolve_outputs(&urls, cli.out.as_deref(), flag_format).await?;
     let jobs = cli.jobs.unwrap_or_else(|| urls.len().min(4)).max(1);
 
     let opts = Arc::new(Opts {
         viewport,
-        full: cli.full,
+        mode: mode.clone(),
         dark: cli.dark,
         wait_ms: cli.wait,
         wait_for: cli.wait_for,
@@ -115,17 +160,44 @@ async fn main() -> Result<()> {
 
     while let Some((url, path, result)) = stream.next().await {
         match result {
-            Ok(shot) => println!(
-                "\u{2713} {} \u{2014} {}\u{d7}{} @{}x, {}",
-                path.display(),
-                viewport.width,
-                shot.height,
-                shot.scale,
-                human_size(shot.bytes),
-            ),
+            Ok(shot) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&success_report(
+                            url.as_str(),
+                            &path,
+                            &mode,
+                            format,
+                            &shot,
+                        ))?
+                    );
+                } else {
+                    println!(
+                        "\u{2713} {} \u{2014} {}\u{d7}{} @{}x, {}",
+                        path.display(),
+                        shot.width,
+                        shot.height,
+                        shot.scale,
+                        human_size(shot.bytes),
+                    );
+                }
+            }
             Err(err) => {
                 failed += 1;
-                eprintln!("\u{2717} {url} \u{2014} {err:#}");
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&error_report(
+                            url.as_str(),
+                            &path,
+                            &mode,
+                            format!("{err:#}"),
+                        ))?
+                    );
+                } else {
+                    eprintln!("\u{2717} {url} \u{2014} {err:#}");
+                }
             }
         }
     }
@@ -139,6 +211,65 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn capture_mode(cli: &Cli) -> CaptureMode {
+    if let Some(selector) = &cli.selector {
+        CaptureMode::Element {
+            selector: selector.clone(),
+            padding: cli.padding.unwrap_or(0),
+        }
+    } else if cli.full {
+        CaptureMode::FullPage
+    } else {
+        CaptureMode::Viewport
+    }
+}
+
+fn success_report<'a>(
+    url: &'a str,
+    path: &std::path::Path,
+    mode: &'a CaptureMode,
+    format: Format,
+    shot: &Shot,
+) -> SuccessReport<'a> {
+    SuccessReport {
+        status: "ok",
+        url,
+        output: absolute_output(path),
+        mode: mode.name(),
+        selector: mode.selector(),
+        padding: mode.padding(),
+        css_width: shot.width,
+        css_height: shot.height,
+        scale: shot.scale,
+        format: format.ext(),
+        bytes: shot.bytes,
+    }
+}
+
+fn error_report<'a>(
+    url: &'a str,
+    path: &std::path::Path,
+    mode: &'a CaptureMode,
+    error: String,
+) -> ErrorReport<'a> {
+    ErrorReport {
+        status: "error",
+        url,
+        output: absolute_output(path),
+        mode: mode.name(),
+        selector: mode.selector(),
+        padding: mode.padding(),
+        error,
+    }
+}
+
+fn absolute_output(path: &std::path::Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn collect_urls(args: &[String]) -> Result<Vec<Url>> {
@@ -262,5 +393,98 @@ fn human_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{} KB", bytes.div_ceil(1024))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::error::ErrorKind;
+
+    use super::*;
+
+    #[test]
+    fn selector_conflicts_with_full_page() {
+        let error = Cli::try_parse_from(["iris", "example.com", "--selector", "h1", "--full"])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn padding_requires_a_selector_and_rejects_negative_values() {
+        let missing_selector = Cli::try_parse_from(["iris", "example.com", "--padding", "12"])
+            .err()
+            .unwrap();
+        assert_eq!(missing_selector.kind(), ErrorKind::MissingRequiredArgument);
+
+        let negative =
+            Cli::try_parse_from(["iris", "example.com", "--selector", "h1", "--padding=-1"])
+                .err()
+                .unwrap();
+        assert_eq!(negative.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn capture_mode_is_constructed_once_from_validated_cli() {
+        let element = Cli::try_parse_from([
+            "iris",
+            "example.com",
+            "--selector",
+            "main > h1",
+            "--padding",
+            "24",
+        ])
+        .unwrap();
+        assert_eq!(
+            capture_mode(&element),
+            CaptureMode::Element {
+                selector: "main > h1".into(),
+                padding: 24,
+            }
+        );
+
+        let full = Cli::try_parse_from(["iris", "example.com", "--full"]).unwrap();
+        assert_eq!(capture_mode(&full), CaptureMode::FullPage);
+
+        let viewport = Cli::try_parse_from(["iris", "example.com"]).unwrap();
+        assert_eq!(capture_mode(&viewport), CaptureMode::Viewport);
+    }
+
+    #[test]
+    fn json_reports_have_stable_typed_fields() {
+        let mode = CaptureMode::Element {
+            selector: "h1".into(),
+            padding: 24,
+        };
+        let shot = Shot {
+            width: 180,
+            height: 72,
+            scale: 2.0,
+            bytes: 14_231,
+        };
+        let success = serde_json::to_string(&success_report(
+            "https://example.com/",
+            std::path::Path::new("/tmp/example.png"),
+            &mode,
+            Format::Png,
+            &shot,
+        ))
+        .unwrap();
+        assert_eq!(
+            success,
+            r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}"#
+        );
+
+        let failure = serde_json::to_string(&error_report(
+            "https://example.com/",
+            std::path::Path::new("/tmp/example.png"),
+            &mode,
+            "selector never appeared: h1".into(),
+        ))
+        .unwrap();
+        assert_eq!(
+            failure,
+            r#"{"status":"error","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"error":"selector never appeared: h1"}"#
+        );
     }
 }

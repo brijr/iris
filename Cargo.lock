@@ -657,12 +657,13 @@ checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "iris"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chromiumoxide",
  "clap",
  "futures",
+ "serde",
  "serde_json",
  "tokio",
  "url",
