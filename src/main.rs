@@ -1,4 +1,5 @@
 mod capture;
+mod mcp;
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -7,10 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use capture::{CaptureMode, Format, Opts, Session, Shot, Viewport};
-use clap::Parser;
+use capture::{CaptureMode, Format, Opts, Session, normalize_url, parse_viewport, success_report};
+use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use serde::Serialize;
 use url::Url;
 
 /// Screenshot live websites. Minimal interface, powerful engine:
@@ -20,14 +20,32 @@ use url::Url;
     name = "iris",
     version,
     arg_required_else_help = true,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true,
     after_help = "\
 Examples:
   iris example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
   iris --full --dark tailwindcss.com    full page, dark color scheme
   iris --selector '#hero' --padding 24 app.dev
+  iris mcp                              serve the capture tool over stdio
   cat urls.txt | iris - -o shots/       concurrent batch from stdin"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    capture: CaptureArgs,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Serve Iris as a local Model Context Protocol camera
+    Mcp(mcp::McpArgs),
+}
+
+#[derive(Args)]
+struct CaptureArgs {
     /// URLs to capture; `-` reads newline-separated URLs from stdin
     #[arg(required = true, value_name = "URL")]
     urls: Vec<String>,
@@ -89,42 +107,18 @@ struct Cli {
     json: bool,
 }
 
-#[derive(Serialize)]
-struct SuccessReport<'a> {
-    status: &'static str,
-    url: &'a str,
-    output: String,
-    mode: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selector: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    padding: Option<u32>,
-    css_width: u32,
-    css_height: u32,
-    scale: f64,
-    format: &'static str,
-    bytes: u64,
-}
-
-#[derive(Serialize)]
-struct ErrorReport<'a> {
-    status: &'static str,
-    url: &'a str,
-    output: String,
-    mode: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    selector: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    padding: Option<u32>,
-    error: String,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(Command::Mcp(args)) = cli.command {
+        return mcp::run(args).await;
+    }
+    run_capture(cli.capture).await
+}
 
+async fn run_capture(cli: CaptureArgs) -> Result<()> {
     let urls = collect_urls(&cli.urls)?;
-    let viewport = parse_size(&cli.size, cli.scale)?;
+    let viewport = parse_viewport(&cli.size, cli.scale)?;
     let mode = capture_mode(&cli);
     let flag_format = cli.format.as_deref().and_then(Format::from_ext);
     let (targets, format) = resolve_outputs(&urls, cli.out.as_deref(), flag_format).await?;
@@ -151,7 +145,10 @@ async fn main() -> Result<()> {
                 let session = Arc::clone(&session);
                 let opts = Arc::clone(&opts);
                 async move {
-                    let result = session.capture(url.as_str(), &path, &opts).await;
+                    let result = match session.capture(url.as_str(), &opts).await {
+                        Ok(image) => image.write_to(&path).await.map(|()| image.shot),
+                        Err(error) => Err(error),
+                    };
                     (url, path, result)
                 }
             }
@@ -166,7 +163,7 @@ async fn main() -> Result<()> {
                         "{}",
                         serde_json::to_string(&success_report(
                             url.as_str(),
-                            &path,
+                            Some(&path),
                             &mode,
                             format,
                             &shot,
@@ -188,9 +185,9 @@ async fn main() -> Result<()> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::to_string(&error_report(
+                        serde_json::to_string(&capture::error_report(
                             url.as_str(),
-                            &path,
+                            Some(&path),
                             &mode,
                             format!("{err:#}"),
                         ))?
@@ -213,7 +210,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn capture_mode(cli: &Cli) -> CaptureMode {
+fn capture_mode(cli: &CaptureArgs) -> CaptureMode {
     if let Some(selector) = &cli.selector {
         CaptureMode::Element {
             selector: selector.clone(),
@@ -224,52 +221,6 @@ fn capture_mode(cli: &Cli) -> CaptureMode {
     } else {
         CaptureMode::Viewport
     }
-}
-
-fn success_report<'a>(
-    url: &'a str,
-    path: &std::path::Path,
-    mode: &'a CaptureMode,
-    format: Format,
-    shot: &Shot,
-) -> SuccessReport<'a> {
-    SuccessReport {
-        status: "ok",
-        url,
-        output: absolute_output(path),
-        mode: mode.name(),
-        selector: mode.selector(),
-        padding: mode.padding(),
-        css_width: shot.width,
-        css_height: shot.height,
-        scale: shot.scale,
-        format: format.ext(),
-        bytes: shot.bytes,
-    }
-}
-
-fn error_report<'a>(
-    url: &'a str,
-    path: &std::path::Path,
-    mode: &'a CaptureMode,
-    error: String,
-) -> ErrorReport<'a> {
-    ErrorReport {
-        status: "error",
-        url,
-        output: absolute_output(path),
-        mode: mode.name(),
-        selector: mode.selector(),
-        padding: mode.padding(),
-        error,
-    }
-}
-
-fn absolute_output(path: &std::path::Path) -> String {
-    std::path::absolute(path)
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .into_owned()
 }
 
 fn collect_urls(args: &[String]) -> Result<Vec<Url>> {
@@ -294,41 +245,7 @@ fn collect_urls(args: &[String]) -> Result<Vec<Url>> {
     if raw.is_empty() {
         bail!("no URLs given");
     }
-    raw.iter()
-        .map(|s| {
-            let s = if s.contains("://") {
-                s.clone()
-            } else {
-                format!("https://{s}")
-            };
-            Url::parse(&s).with_context(|| format!("invalid URL: {s}"))
-        })
-        .collect()
-}
-
-fn parse_size(size: &str, scale: Option<f64>) -> Result<Viewport> {
-    let (width, height, preset_scale, mobile) = match size {
-        "desktop" => (1440, 900, 2.0, false),
-        "iphone" => (390, 844, 3.0, true),
-        "ipad" => (1024, 1366, 2.0, false),
-        custom => {
-            let (w, h) = custom
-                .split_once(['x', 'X'])
-                .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
-                .with_context(|| {
-                    format!(
-                        "invalid --size {custom:?}: use WxH (e.g. 1440x900) or desktop|iphone|ipad"
-                    )
-                })?;
-            (w, h, 2.0, false)
-        }
-    };
-    Ok(Viewport {
-        width,
-        height,
-        scale: scale.unwrap_or(preset_scale),
-        mobile,
-    })
+    raw.iter().map(|value| normalize_url(value)).collect()
 }
 
 /// Pair each URL with its output path and settle the image format. Single URL +
@@ -401,6 +318,7 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
+    use crate::capture::Shot;
 
     #[test]
     fn selector_conflicts_with_full_page() {
@@ -436,7 +354,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            capture_mode(&element),
+            capture_mode(&element.capture),
             CaptureMode::Element {
                 selector: "main > h1".into(),
                 padding: 24,
@@ -444,10 +362,21 @@ mod tests {
         );
 
         let full = Cli::try_parse_from(["iris", "example.com", "--full"]).unwrap();
-        assert_eq!(capture_mode(&full), CaptureMode::FullPage);
+        assert_eq!(capture_mode(&full.capture), CaptureMode::FullPage);
 
         let viewport = Cli::try_parse_from(["iris", "example.com"]).unwrap();
-        assert_eq!(capture_mode(&viewport), CaptureMode::Viewport);
+        assert_eq!(capture_mode(&viewport.capture), CaptureMode::Viewport);
+    }
+
+    #[test]
+    fn mcp_subcommand_does_not_require_a_url() {
+        let cli = Cli::try_parse_from(["iris", "mcp"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Mcp(_))));
+
+        let conflict = Cli::try_parse_from(["iris", "mcp", "--dark"])
+            .err()
+            .unwrap();
+        assert_eq!(conflict.kind(), ErrorKind::UnknownArgument);
     }
 
     #[test]
@@ -464,7 +393,7 @@ mod tests {
         };
         let success = serde_json::to_string(&success_report(
             "https://example.com/",
-            std::path::Path::new("/tmp/example.png"),
+            Some(std::path::Path::new("/tmp/example.png")),
             &mode,
             Format::Png,
             &shot,
@@ -475,9 +404,9 @@ mod tests {
             r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}"#
         );
 
-        let failure = serde_json::to_string(&error_report(
+        let failure = serde_json::to_string(&capture::error_report(
             "https://example.com/",
-            std::path::Path::new("/tmp/example.png"),
+            Some(std::path::Path::new("/tmp/example.png")),
             &mode,
             "selector never appeared: h1".into(),
         ))

@@ -1,4 +1,6 @@
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,13 +16,37 @@ use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
+use url::Url;
 
 const IPHONE_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) \
      AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
+static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Copy)]
+struct ProfileDir(PathBuf);
+
+impl ProfileDir {
+    fn unique() -> Self {
+        Self(std::env::temp_dir().join(format!(
+            "iris-chrome-{}-{}",
+            std::process::id(),
+            PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ProfileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub width: u32,
     pub height: u32,
@@ -28,7 +54,18 @@ pub struct Viewport {
     pub mobile: bool,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+impl Viewport {
+    pub fn desktop() -> Self {
+        Self {
+            width: 1440,
+            height: 900,
+            scale: 2.0,
+            mobile: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Format {
     Png,
     Jpeg,
@@ -50,6 +87,14 @@ impl Format {
             Self::Png => "png",
             Self::Jpeg => "jpg",
             Self::Webp => "webp",
+        }
+    }
+
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Webp => "image/webp",
         }
     }
 
@@ -93,6 +138,7 @@ impl CaptureMode {
     }
 }
 
+#[derive(Debug)]
 pub struct Opts {
     pub viewport: Viewport,
     pub mode: CaptureMode,
@@ -112,6 +158,103 @@ pub struct Shot {
     /// ~16k texture limit fall back to 1x).
     pub scale: f64,
     pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SuccessReport {
+    status: &'static str,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    padding: Option<u32>,
+    css_width: u32,
+    css_height: u32,
+    scale: f64,
+    format: &'static str,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorReport {
+    status: &'static str,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    mode: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    padding: Option<u32>,
+    error: String,
+}
+
+pub fn success_report(
+    url: &str,
+    output: Option<&Path>,
+    mode: &CaptureMode,
+    format: Format,
+    shot: &Shot,
+) -> SuccessReport {
+    SuccessReport {
+        status: "ok",
+        url: url.into(),
+        output: output.map(absolute_output),
+        mode: mode.name(),
+        selector: mode.selector().map(str::to_owned),
+        padding: mode.padding(),
+        css_width: shot.width,
+        css_height: shot.height,
+        scale: shot.scale,
+        format: format.ext(),
+        bytes: shot.bytes,
+    }
+}
+
+pub fn error_report(
+    url: &str,
+    output: Option<&Path>,
+    mode: &CaptureMode,
+    error: String,
+) -> ErrorReport {
+    ErrorReport {
+        status: "error",
+        url: url.into(),
+        output: output.map(absolute_output),
+        mode: mode.name(),
+        selector: mode.selector().map(str::to_owned),
+        padding: mode.padding(),
+        error,
+    }
+}
+
+pub fn absolute_output(path: &Path) -> String {
+    std::path::absolute(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[derive(Debug)]
+pub struct CapturedImage {
+    pub shot: Shot,
+    pub data: Vec<u8>,
+}
+
+impl CapturedImage {
+    pub async fn write_to(&self, out: &Path) -> Result<()> {
+        if let Some(parent) = out.parent().filter(|path| !path.as_os_str().is_empty()) {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        tokio::fs::write(out, &self.data)
+            .await
+            .with_context(|| format!("failed to write {}", out.display()))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,13 +278,19 @@ struct ClipRect {
 pub struct Session {
     browser: Browser,
     handler: JoinHandle<()>,
+    // Declared after Browser so fallback field-drop cleanup happens after
+    // Chromiumoxide has stopped its child process.
+    profile_dir: ProfileDir,
     /// Browser's real UA with "HeadlessChrome" scrubbed, so sites don't serve degraded pages.
     user_agent: Option<String>,
 }
 
 impl Session {
     pub async fn launch(chrome: Option<PathBuf>, viewport: Viewport) -> Result<Self> {
-        let mut config = BrowserConfig::builder().window_size(viewport.width, viewport.height);
+        let profile_dir = ProfileDir::unique();
+        let mut config = BrowserConfig::builder()
+            .window_size(viewport.width, viewport.height)
+            .user_data_dir(profile_dir.path());
         if let Some(path) = chrome.or_else(find_chrome) {
             config = config.chrome_executable(path);
         }
@@ -168,15 +317,16 @@ impl Session {
         Ok(Self {
             browser,
             handler,
+            profile_dir,
             user_agent,
         })
     }
 
-    pub async fn capture(&self, url: &str, out: &Path, opts: &Opts) -> Result<Shot> {
+    pub async fn capture(&self, url: &str, opts: &Opts) -> Result<CapturedImage> {
         let page = tokio::time::timeout(opts.timeout, self.browser.new_page("about:blank"))
             .await
             .map_err(|_| anyhow!("timed out opening a tab"))??;
-        let result = tokio::time::timeout(opts.timeout, self.pipeline(&page, url, out, opts))
+        let result = tokio::time::timeout(opts.timeout, self.pipeline(&page, url, opts))
             .await
             .map_err(|_| anyhow!("timed out after {}s", opts.timeout.as_secs()))
             .and_then(|r| r);
@@ -184,7 +334,11 @@ impl Session {
         result
     }
 
-    async fn pipeline(&self, page: &Page, url: &str, out: &Path, opts: &Opts) -> Result<Shot> {
+    pub fn is_healthy(&self) -> bool {
+        !self.handler.is_finished()
+    }
+
+    async fn pipeline(&self, page: &Page, url: &str, opts: &Opts) -> Result<CapturedImage> {
         let started = std::time::Instant::now();
         let v = opts.viewport;
         page.execute(
@@ -345,14 +499,14 @@ impl Session {
         };
 
         let bytes = data.len() as u64;
-        tokio::fs::write(out, data)
-            .await
-            .with_context(|| format!("failed to write {}", out.display()))?;
-        Ok(Shot {
-            width,
-            height,
-            scale,
-            bytes,
+        Ok(CapturedImage {
+            shot: Shot {
+                width,
+                height,
+                scale,
+                bytes,
+            },
+            data,
         })
     }
 
@@ -398,6 +552,62 @@ impl Session {
             let _ = self.browser.kill().await;
         }
         self.handler.abort();
+        let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
+    }
+}
+
+pub fn parse_viewport(size: &str, scale: Option<f64>) -> Result<Viewport> {
+    let (width, height, preset_scale, mobile) = match size {
+        "desktop" => (1440, 900, 2.0, false),
+        "iphone" => (390, 844, 3.0, true),
+        "ipad" => (1024, 1366, 2.0, false),
+        custom => {
+            let (width, height) = custom
+                .split_once(['x', 'X'])
+                .and_then(|(width, height)| {
+                    Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+                })
+                .with_context(|| {
+                    format!(
+                        "invalid size {custom:?}: use WxH (e.g. 1440x900) or desktop|iphone|ipad"
+                    )
+                })?;
+            if width == 0 || height == 0 {
+                bail!("invalid size {custom:?}: width and height must be greater than zero");
+            }
+            (width, height, 2.0, false)
+        }
+    };
+    let scale = scale.unwrap_or(preset_scale);
+    if !scale.is_finite() || scale <= 0.0 {
+        bail!("invalid scale {scale}: use a finite number greater than zero");
+    }
+    Ok(Viewport {
+        width,
+        height,
+        scale,
+        mobile,
+    })
+}
+
+pub fn normalize_url(raw: &str) -> Result<Url> {
+    if raw.contains("://") {
+        return Url::parse(raw).with_context(|| format!("invalid URL: {raw}"));
+    }
+
+    let http =
+        Url::parse(&format!("http://{raw}")).with_context(|| format!("invalid URL: {raw}"))?;
+    let local = http.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host.to_ascii_lowercase().ends_with(".localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| address.is_loopback() || address.is_unspecified())
+    });
+    if local {
+        Ok(http)
+    } else {
+        Url::parse(&format!("https://{raw}")).with_context(|| format!("invalid URL: {raw}"))
     }
 }
 
@@ -656,6 +866,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_urls_use_http_and_public_hosts_use_https() {
+        assert_eq!(
+            normalize_url("localhost:3000").unwrap().as_str(),
+            "http://localhost:3000/"
+        );
+        assert_eq!(
+            normalize_url("app.localhost:4173").unwrap().as_str(),
+            "http://app.localhost:4173/"
+        );
+        assert_eq!(
+            normalize_url("127.0.0.1:8080").unwrap().as_str(),
+            "http://127.0.0.1:8080/"
+        );
+        assert_eq!(
+            normalize_url("example.com").unwrap().as_str(),
+            "https://example.com/"
+        );
+        assert_eq!(
+            normalize_url("http://example.com").unwrap().as_str(),
+            "http://example.com/"
+        );
+    }
+
+    #[test]
+    fn viewport_rejects_zero_dimensions_and_invalid_scales() {
+        assert!(parse_viewport("0x900", None).is_err());
+        assert!(parse_viewport("1440x0", None).is_err());
+        assert!(parse_viewport("desktop", Some(0.0)).is_err());
+        assert!(parse_viewport("desktop", Some(f64::NAN)).is_err());
+    }
+
     #[tokio::test]
     async fn browser_element_capture_contract() -> Result<()> {
         let temp = std::env::temp_dir().join(format!("iris-browser-{}", std::process::id()));
@@ -674,13 +916,13 @@ mod tests {
         let session = Session::launch(None, viewport).await?;
 
         let one_x_path = temp.join("target-1x.png");
-        let one_x = session
-            .capture(
-                url.as_str(),
-                &one_x_path,
-                &element_opts(viewport, ".capture-target", 10, Format::Png),
-            )
-            .await?;
+        let one_x = capture_to(
+            &session,
+            url.as_str(),
+            &one_x_path,
+            &element_opts(viewport, ".capture-target", 10, Format::Png),
+        )
+        .await?;
         // The first duplicate starts at 80.5px and transitions to 120.5px only
         // after scrolling into view. The final 141x81 frame proves first-match,
         // automatic scroll/settle, outward rounding, and padding together.
@@ -695,13 +937,13 @@ mod tests {
             ..viewport
         };
         let two_x_path = temp.join("target-2x.png");
-        let two_x = session
-            .capture(
-                url.as_str(),
-                &two_x_path,
-                &element_opts(two_x_viewport, ".capture-target", 10, Format::Png),
-            )
-            .await?;
+        let two_x = capture_to(
+            &session,
+            url.as_str(),
+            &two_x_path,
+            &element_opts(two_x_viewport, ".capture-target", 10, Format::Png),
+        )
+        .await?;
         assert_eq!((two_x.width, two_x.height), (141, 81));
         assert_eq!(
             png_dimensions(&tokio::fs::read(&two_x_path).await?),
@@ -709,34 +951,70 @@ mod tests {
         );
 
         let jpeg_path = temp.join("target.jpg");
-        session
-            .capture(
-                url.as_str(),
-                &jpeg_path,
-                &element_opts(viewport, ".capture-target", 0, Format::Jpeg),
-            )
-            .await?;
+        capture_to(
+            &session,
+            url.as_str(),
+            &jpeg_path,
+            &element_opts(viewport, ".capture-target", 0, Format::Jpeg),
+        )
+        .await?;
         let jpeg = tokio::fs::read(&jpeg_path).await?;
         assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]));
 
         let webp_path = temp.join("target.webp");
-        session
-            .capture(
-                url.as_str(),
-                &webp_path,
-                &element_opts(viewport, ".capture-target", 0, Format::Webp),
-            )
-            .await?;
+        capture_to(
+            &session,
+            url.as_str(),
+            &webp_path,
+            &element_opts(viewport, ".capture-target", 0, Format::Webp),
+        )
+        .await?;
         let webp = tokio::fs::read(&webp_path).await?;
         assert_eq!(&webp[..4], b"RIFF");
         assert_eq!(&webp[8..12], b"WEBP");
 
-        let invalid = session
+        let dark_viewport = session
             .capture(
                 url.as_str(),
-                &temp.join("invalid.png"),
-                &element_opts(viewport, "[", 0, Format::Png),
+                &page_opts(viewport, CaptureMode::Viewport, true),
             )
+            .await?;
+        assert_eq!(
+            (dark_viewport.shot.width, dark_viewport.shot.height),
+            (320, 240)
+        );
+        assert_eq!(png_dimensions(&dark_viewport.data), (320, 240));
+
+        let full_page = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::FullPage, false),
+            )
+            .await?;
+        assert_eq!(full_page.shot.width, 320);
+        assert!(full_page.shot.height > viewport.height);
+        assert_eq!(
+            png_dimensions(&full_page.data),
+            (full_page.shot.width, full_page.shot.height)
+        );
+
+        let phone = Viewport {
+            width: 390,
+            height: 844,
+            scale: 1.0,
+            mobile: true,
+        };
+        let mobile = session
+            .capture(
+                url.as_str(),
+                &page_opts(phone, CaptureMode::Viewport, false),
+            )
+            .await?;
+        assert_eq!((mobile.shot.width, mobile.shot.height), (390, 844));
+        assert_eq!(png_dimensions(&mobile.data), (390, 844));
+
+        let invalid = session
+            .capture(url.as_str(), &element_opts(viewport, "[", 0, Format::Png))
             .await
             .unwrap_err();
         assert!(format!("{invalid:#}").contains("invalid selector: ["));
@@ -746,7 +1024,6 @@ mod tests {
         let missing = session
             .capture(
                 missing_url.as_str(),
-                &temp.join("missing.png"),
                 &element_opts(viewport, ".capture-target", 0, Format::Png),
             )
             .await
@@ -756,7 +1033,6 @@ mod tests {
         let zero = session
             .capture(
                 url.as_str(),
-                &temp.join("zero.png"),
                 &element_opts(viewport, "#zero-size", 0, Format::Png),
             )
             .await
@@ -781,6 +1057,24 @@ mod tests {
             timeout: Duration::from_secs(3),
             format,
         }
+    }
+
+    fn page_opts(viewport: Viewport, mode: CaptureMode, dark: bool) -> Opts {
+        Opts {
+            viewport,
+            mode,
+            dark,
+            wait_ms: 0,
+            wait_for: None,
+            timeout: Duration::from_secs(5),
+            format: Format::Png,
+        }
+    }
+
+    async fn capture_to(session: &Session, url: &str, path: &Path, opts: &Opts) -> Result<Shot> {
+        let image = session.capture(url, opts).await?;
+        image.write_to(path).await?;
+        Ok(image.shot)
     }
 
     fn png_dimensions(bytes: &[u8]) -> (u32, u32) {

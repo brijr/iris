@@ -1,8 +1,8 @@
 [package]
 name = "iris-screenshot"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Minimal, powerful screenshots of live websites"
 license = "MIT"
 repository = "https://github.com/brijr/iris"
@@ -16,12 +16,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
+rmcp = { version = "3.1.2", default-features = false, features = ["macros", "server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "fs", "io-std", "sync"] }
 url = "2"
 
 [profile.release]
