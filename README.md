@@ -57,8 +57,6 @@ Or use the equivalent configuration in another MCP client:
 }
 ```
 
-## Setup Prompt
-
 The server exposes one tool, `capture`, which returns the image inline with structured metadata. It writes nothing by default; pass `output` when the agent also needs a file.
 
 ```json
@@ -77,6 +75,8 @@ The server exposes one tool, `capture`, which returns the image inline with stru
 Bare localhost, `.localhost`, and loopback addresses use HTTP automatically. Other bare hosts use HTTPS. Run `iris mcp --help` to select a Chrome binary for the server.
 
 MCP clients may need a fresh agent task before the newly registered `capture` tool appears.
+
+## Setup Prompt
 
 Give this setup prompt to your coding agent</summary>
 
