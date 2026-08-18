@@ -1,5 +1,7 @@
 # iris
 
+<img width="1448" height="1086" alt="ChatGPT Image Aug 18, 2026, 12_50_00 PM" src="https://github.com/user-attachments/assets/9acb5597-afea-41ed-b4a1-63195c2ce662" />
+
 A camera for coding agents. One fast command or MCP tool call produces one trustworthy image.
 
 ```
