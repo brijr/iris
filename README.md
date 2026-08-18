@@ -55,6 +55,8 @@ Or use the equivalent configuration in another MCP client:
 }
 ```
 
+## Setup Prompt
+
 The server exposes one tool, `capture`, which returns the image inline with structured metadata. It writes nothing by default; pass `output` when the agent also needs a file.
 
 ```json
@@ -74,8 +76,7 @@ Bare localhost, `.localhost`, and loopback addresses use HTTP automatically. Oth
 
 MCP clients may need a fresh agent task before the newly registered `capture` tool appears.
 
-<details>
-<summary>Give this setup prompt to your coding agent</summary>
+Give this setup prompt to your coding agent</summary>
 
 ```text
 Set up Iris as your visual camera in this coding environment.
@@ -118,8 +119,6 @@ both the CLI and MCP paths work. Do not modify the application repository.
 Do not claim MCP success from the CLI test alone. Do not add browser automation,
 interaction scripting, or review tooling; use Iris only as the camera.
 ```
-
-</details>
 
 ## What it does for you
 
