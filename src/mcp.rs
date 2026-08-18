@@ -339,10 +339,46 @@ pub async fn run(args: McpArgs) -> Result<()> {
         .serve(rmcp::transport::stdio())
         .await
         .context("failed to start Iris MCP server")?;
-    let result = service.waiting().await;
+    let cancellation = service.cancellation_token();
+    let waiting = service.waiting();
+    tokio::pin!(waiting);
+    let (result, signalled) = tokio::select! {
+        result = &mut waiting => (Ok(result), false),
+        signal = shutdown_signal() => {
+            cancellation.cancel();
+            let result = waiting.await;
+            (signal.map(|()| result), true)
+        }
+    };
     state.close().await;
-    result.context("Iris MCP server task failed")?;
+    result?.context("Iris MCP server task failed")?;
+    if signalled {
+        // Tokio's stdio reader uses a blocking thread that cannot be cancelled
+        // while a client keeps stdin open. All Iris and RMCP cleanup is complete,
+        // so exit directly instead of hanging during runtime teardown.
+        std::process::exit(0);
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?;
+    tokio::select! {
+        _ = terminate.recv() => {}
+        _ = interrupt.recv() => {}
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<()> {
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to listen for Ctrl-C")
 }
 
 #[cfg(test)]

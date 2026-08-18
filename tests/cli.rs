@@ -210,6 +210,125 @@ fn mcp_stdio_lists_one_tool_and_returns_an_inline_capture() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mcp_sigterm_closes_chrome_and_removes_its_profile() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/precise-capture.html")
+        .canonicalize()
+        .unwrap();
+    let url = Url::from_file_path(fixture).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let profile_marker = format!("iris-chrome-{}-0", child.id());
+    let profile = std::env::temp_dir().join(&profile_marker);
+    let stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            sender.send(line.unwrap()).unwrap();
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+
+    send_message(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": { "name": "iris-signal-test", "version": "0.0.0" }
+            }
+        }),
+    );
+    receive_response(&receiver, 1, Duration::from_secs(5));
+    send_message(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    );
+    send_message(
+        &mut stdin,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "capture",
+                "arguments": {
+                    "url": url.as_str(),
+                    "selector": ".capture-target",
+                    "size": "320x240",
+                    "scale": 1,
+                    "timeout_seconds": 3
+                }
+            }
+        }),
+    );
+    let captured = receive_response(&receiver, 2, Duration::from_secs(15));
+    assert_eq!(captured["result"]["isError"], false);
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal.success());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut timed_out = false;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait().unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    drop(stdin);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    let leftovers = loop {
+        let processes = matching_processes(&profile_marker);
+        if processes.is_empty() && !profile.exists() {
+            break processes;
+        }
+        if Instant::now() >= cleanup_deadline {
+            break processes;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let profile_left = profile.exists();
+
+    // A red run still cleans up the exact test-owned Chrome tree.
+    for pid in &leftovers {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&profile);
+    reader.join().unwrap();
+
+    assert!(
+        !timed_out && status.success() && leftovers.is_empty() && !profile_left,
+        "SIGTERM cleanup failed: timed_out={timed_out}, status={status}, Chrome PIDs={leftovers:?}, profile_exists={profile_left}"
+    );
+}
+
 fn send_message(stdin: &mut impl Write, message: Value) {
     writeln!(stdin, "{}", serde_json::to_string(&message).unwrap()).unwrap();
     stdin.flush().unwrap();
@@ -228,6 +347,20 @@ fn receive_response(receiver: &Receiver<String>, id: u64, timeout: Duration) -> 
             return message;
         }
     }
+}
+
+#[cfg(unix)]
+fn matching_processes(marker: &str) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["ax", "-o", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains(marker))
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect()
 }
 
 fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
