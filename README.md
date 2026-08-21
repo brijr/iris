@@ -78,7 +78,7 @@ MCP clients may need a fresh agent task before the newly registered `capture` to
 
 ## Setup Prompt
 
-Give this setup prompt to your coding agent</summary>
+Give this setup prompt to your coding agent:
 
 ```text
 Set up Iris as your visual camera in this coding environment.
