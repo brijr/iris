@@ -28,7 +28,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
       - run: tar -C target/${{ matrix.target }}/release -czf iris-${{ matrix.target }}.tar.gz iris
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: iris-${{ matrix.target }}
           path: iris-${{ matrix.target }}.tar.gz
@@ -37,10 +37,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: iris-*.tar.gz
           generate_release_notes: true
