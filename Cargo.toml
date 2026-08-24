@@ -18,7 +18,7 @@ path = "src/main.rs"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 rmcp = { version = "3.1.2", default-features = false, features = ["macros", "server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
