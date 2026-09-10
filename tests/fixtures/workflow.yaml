@@ -1,0 +1,16 @@
+# Example Iris workflow: the same documentation screenshots, reproducible
+# locally and in CI. Run with: iris --workflow workflow.yaml --json
+url: https://app.example.com
+size: desktop
+steps:
+  - click: "text=Conditions"
+redact:
+  - ".client-name"
+annotations:
+  - selector: "#search"
+    number: 1
+    label: Find a condition
+  - selector: "#run-analysis"
+    number: 2
+    label: Review documents
+output: shots/conditions.png

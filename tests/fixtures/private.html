@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Iris masking fixture</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background: #f5f3ee;
+        font: 400 14px/1.5 system-ui, sans-serif;
+      }
+
+      .matter {
+        padding: 16px;
+        max-width: 420px;
+      }
+
+      .client-name {
+        font-weight: 700;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="matter" id="conditions">
+      <p>Matter notes for <span class="client-name">Ada Lovelace</span>.</p>
+      <p data-private>Internal reference: VA-2026-1847.</p>
+      <p>Reach her at ada@example.com or (415) 555-0132.</p>
+      <p>SSN on file: 078-05-1120. Card ending 4111 1111 1111 1111.</p>
+      <p>Order 90210 ships Thursday.</p>
+      <label>Contact email <input id="contact" type="text" value="ada@example.com"></label>
+    </div>
+  </body>
+</html>

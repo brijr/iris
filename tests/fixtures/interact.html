@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Iris interaction fixture</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+        background: #f5f3ee;
+      }
+
+      .tabs {
+        display: flex;
+        gap: 8px;
+        padding: 16px;
+      }
+
+      .tabs button {
+        font: 500 14px/1.4 system-ui, sans-serif;
+        padding: 8px 16px;
+        cursor: pointer;
+      }
+
+      #dialog {
+        box-sizing: border-box;
+        width: 220px;
+        min-height: 60px;
+        margin: 16px;
+        padding: 12px;
+        border: 4px solid #10231b;
+        background: #2bc477;
+      }
+
+      #search-form {
+        padding: 16px;
+      }
+
+      #search-form input {
+        font: 400 14px/1.4 system-ui, sans-serif;
+        padding: 8px;
+        width: 200px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="tabs">
+      <button type="button" id="conditions-tab">Conditions</button>
+      <button type="button" id="open-btn">Run analysis</button>
+    </div>
+    <div id="dialog-host"></div>
+    <form id="search-form" action="javascript:void 0">
+      <input id="search" name="q" type="text" value="" autocomplete="off">
+    </form>
+    <script>
+      // The dialog is absent from the DOM until the button is clicked, so
+      // capturing #dialog without interacting must fail its element wait.
+      document.getElementById("open-btn").addEventListener("click", () => {
+        if (document.getElementById("dialog")) return;
+        const dialog = document.createElement("div");
+        dialog.id = "dialog";
+        dialog.setAttribute("role", "dialog");
+        dialog.textContent = "Analysis running";
+        document.getElementById("dialog-host").appendChild(dialog);
+      });
+    </script>
+  </body>
+</html>

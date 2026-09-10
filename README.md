@@ -13,6 +13,10 @@ iris -o shots/ a.com b.com c.com        # batch, captured concurrently
 cat urls.txt | iris - -o shots/         # batch from stdin (# comments ok)
 iris -o hero.jpg --wait-for 'h1' app.dev
 iris --selector 'h1' --json app.dev      # machine-readable JSON Lines
+iris app.dev \                            # annotated walkthrough step
+  --point '#conditions-tab' 'Open Conditions' \
+  --point '#search' 'Find a condition' \
+  --point '#run-analysis' 'Run analysis'
 ```
 
 `iris --full bridger.to` →
@@ -133,11 +137,54 @@ interaction scripting, or review tooling; use Iris only as the camera.
 - One browser process, concurrent tabs; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)
 - Batch filenames derive from the URL (`example.com-pricing.png`); collisions get `-2`, `-3` suffixes
 - `--json` writes one JSON object per completed capture to stdout, in concurrent completion order; capture failures are JSON too and still produce exit code 1
+- Annotates before capturing: repeatable `--point 'SELECTOR' 'label'` draws a numbered marker, leader label, and outline (numbering follows flag order, labels auto-place beside the target); `--highlight 'CSS'` outlines elements; `--dim` dims the rest of the page. Element clips grow to include nearby markers so annotations are never cropped. The MCP `capture` tool takes the same `annotations`, `highlight`, and `dim` fields
+- Interacts before capturing: repeatable `--click 'TARGET'` (CSS or `text=...`), `--fill 'SELECTOR' 'TEXT'`, `--hover 'CSS'`, `--press KEY`, and `--open 'CSS'` (same action as click, for menus and drawers). Order is kept within each flag; different kinds run grouped as clicks, fills, hovers, presses. The MCP `capture` tool takes an ordered `steps` array for exact mixed ordering. A missing step target fails fast with a step-indexed error (e.g. `step 1 (click): target never appeared: #missing`)
+- Redacts before capturing: repeatable `--mask 'CSS'` covers every match with ink (or `--mask-blur PX` blur); opt-in `--mask-patterns email,phone,ssn,account` also covers sensitive-data matches in text and form values. Patterns are conservative (separators and word boundaries required) and off by default. The JSON report counts redaction boxes (`masked`); the MCP `capture` tool takes `redact`, `mask_blur_px`, and `redact_patterns`
+- Repeats color output deterministically: `--color-scheme light|dark|system` (default `system`, i.e. no override) with `--light` / `--dark` shorthands. The JSON report records the effective scheme; the MCP `capture` tool takes `color_scheme` (`dark: true` still means dark)
+- Reuses signed-in sessions: `iris login --session matteros https://app.example.com` opens a visible browser for one manual sign-in, then `iris --session matteros https://app.example.com/va/matters` (or MCP `capture` with `session`) captures with its cookies and storage. Sessions live under the OS data dir (`~/Library/Application Support/iris/sessions` on macOS)
 
 Element capture is intentionally CSS-selector based: Iris captures the first match in document order. `--selector` conflicts with `--full`; `--padding` requires it. Cross-origin iframe contents and capturing every match are not supported.
 
 ```json
 {"status":"ok","url":"https://example.com/","output":"/absolute/example.com.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}
+```
+
+## Repeatable workflows
+
+Put the URL, viewport, interactions, redactions, annotations, selector, and
+output filename in a YAML or JSON recipe, then run the same documentation
+screenshots locally and in CI:
+
+```yaml
+url: https://app.example.com
+size: desktop
+steps:
+  - click: "text=Conditions"
+redact:
+  - ".client-name"
+annotations:
+  - selector: "#search"
+    number: 1
+    label: Find a condition
+  - selector: "#run-analysis"
+    number: 2
+    label: Review documents
+output: shots/conditions.png
+```
+
+```sh
+iris --workflow docs/conditions.yaml --json   # repeatable; --workflow is repeatable too
+iris --workflow docs/conditions.yaml --dry-run  # print the resolved plan without launching Chrome
+```
+
+Recipes validate strictly (unknown fields fail fast naming the field) and
+share one code path with MCP `capture`, so a file, a flag invocation, and a
+tool call with the same values capture identically. Recipes carry their own
+capture spec including timeout; `--jobs`, `--chrome`, and `--json` still
+apply. In CI:
+
+```yaml
+- run: iris --workflow docs/conditions.yaml --json
 ```
 
 ## Benchmarking

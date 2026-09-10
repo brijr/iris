@@ -8,6 +8,95 @@ use serde_json::Value;
 use url::Url;
 
 #[test]
+fn workflow_dry_run_prints_resolved_plan_without_chrome() {
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workflow.yaml");
+    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .args(["--workflow", fixture.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["status"], "ok");
+    assert_eq!(plan["url"], "https://app.example.com/");
+    assert_eq!(plan["mode"], "viewport");
+    assert_eq!(plan["steps"], 1);
+    assert_eq!(plan["annotations"], 2);
+    assert_eq!(plan["masks"], 1);
+    assert_eq!(plan["color_scheme"], "system");
+    assert_eq!(plan["format"], "png");
+    assert!(
+        plan["output"]
+            .as_str()
+            .unwrap()
+            .ends_with("shots/conditions.png"),
+        "unexpected output: {}",
+        plan["output"]
+    );
+
+    // A JSON recipe with an element frame resolves the same way.
+    let temp = std::env::temp_dir().join(format!("iris-workflow-{}", std::process::id()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let recipe = temp.join("element.json");
+    std::fs::write(
+        &recipe,
+        serde_json::json!({
+            "url": "example.com",
+            "selector": "#conditions",
+            "padding": 12,
+            "color_scheme": "light",
+            "session": "matteros",
+            "output": "shots/conditions.png",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .args(["--workflow", recipe.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["mode"], "element");
+    assert_eq!(plan["selector"], "#conditions");
+    assert_eq!(plan["padding"], 12);
+    assert_eq!(plan["color_scheme"], "light");
+    assert_eq!(plan["session"], "matteros");
+
+    // Unknown fields fail fast with the field named.
+    let bad = temp.join("bad.yaml");
+    std::fs::write(&bad, "url: example.com\nfrobnicate: 1\noutput: a.png\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .args(["--workflow", bad.to_str().unwrap(), "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("frobnicate"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Capture flags conflict with recipe files; dry runs need a recipe.
+    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .args(["--workflow", fixture.to_str().unwrap(), "--selector", "h1"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let output = Command::new(env!("CARGO_BIN_EXE_iris"))
+        .args(["--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn json_batch_reports_success_and_failure_on_stdout() {
     let temp = std::env::temp_dir().join(format!("iris-json-batch-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();

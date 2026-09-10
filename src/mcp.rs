@@ -38,9 +38,11 @@ pub struct CaptureRequest {
     full_page: bool,
     /// Viewport as WxH or desktop, iphone, or ipad. Defaults to desktop.
     size: Option<String>,
-    /// Emulate prefers-color-scheme: dark.
+    /// Emulate prefers-color-scheme: dark (shorthand for color_scheme dark).
     #[serde(default)]
     dark: bool,
+    /// Force a color scheme: light, dark, or system. Defaults to system.
+    color_scheme: Option<ColorSchemeRequest>,
     /// Image format. Defaults to png; a recognized output extension wins.
     format: Option<ImageFormat>,
     /// Extra settle delay in milliseconds after smart waiting.
@@ -48,12 +50,110 @@ pub struct CaptureRequest {
     wait_ms: u64,
     /// Wait until this CSS selector exists before capturing.
     wait_for: Option<String>,
+    /// Ordered interactions to perform before capturing.
+    steps: Option<Vec<StepRequest>>,
+    /// Redact elements: cover every match of each CSS selector.
+    redact: Option<Vec<String>>,
+    /// Blur masked content instead of covering it with ink.
+    mask_blur_px: Option<u32>,
+    /// Also redact sensitive-data matches (off by default).
+    redact_patterns: Option<Vec<RedactPattern>>,
+    /// Numbered markers with labels pointing at elements, in list order.
+    annotations: Option<Vec<AnnotationRequest>>,
+    /// Outline the first element matching each CSS selector.
+    highlight: Option<Vec<String>>,
+    /// Dim the page outside annotated and highlighted elements.
+    #[serde(default)]
+    dim: bool,
+    /// Capture with a saved session (`iris login --session NAME <url>`).
+    session: Option<String>,
     /// Device scale factor overriding the viewport preset.
     scale: Option<f64>,
     /// Per-page timeout in seconds. Defaults to 30.
     timeout_seconds: Option<u64>,
     /// Optional image path. Relative paths resolve from the MCP server working directory.
     output: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+pub struct AnnotationRequest {
+    /// CSS selector of the element to point at (first match wins).
+    selector: String,
+    /// Short label shown beside the marker.
+    label: String,
+}
+
+/// Forced color scheme. `system` applies no override; `dark: true` stays as a
+/// back-compat shorthand for `dark` and conflicts with this field.
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorSchemeRequest {
+    Light,
+    Dark,
+    System,
+}
+
+impl ColorSchemeRequest {
+    fn capture_scheme(self) -> crate::capture::ColorScheme {
+        match self {
+            Self::Light => crate::capture::ColorScheme::Light,
+            Self::Dark => crate::capture::ColorScheme::Dark,
+            Self::System => crate::capture::ColorScheme::System,
+        }
+    }
+}
+
+/// Opt-in sensitive-data detector for masking.
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum RedactPattern {
+    Email,
+    Phone,
+    Ssn,
+    Account,
+}
+
+impl RedactPattern {
+    fn capture_pattern(self) -> crate::capture::MaskPattern {
+        match self {
+            Self::Email => crate::capture::MaskPattern::Email,
+            Self::Phone => crate::capture::MaskPattern::Phone,
+            Self::Ssn => crate::capture::MaskPattern::Ssn,
+            Self::Account => crate::capture::MaskPattern::Account,
+        }
+    }
+}
+
+/// One pre-capture interaction. Array order is the execution order.
+#[derive(Clone, Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum StepRequest {
+    Click {
+        /// CSS selector or `text=...` to click.
+        click: String,
+    },
+    Open {
+        /// CSS selector to open (menus, drawers); same action as click.
+        open: String,
+    },
+    Fill {
+        /// CSS selector of the input to fill.
+        fill: String,
+        /// Text to type into the input.
+        text: String,
+    },
+    Hover {
+        /// CSS selector to hover.
+        hover: String,
+    },
+    Press {
+        /// Keyboard key to press, e.g. Enter or Escape.
+        press: String,
+    },
+    WaitFor {
+        /// Wait until this CSS selector exists before continuing.
+        wait_for: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema)]
@@ -76,14 +176,54 @@ impl ImageFormat {
 }
 
 #[derive(Debug)]
-struct PreparedCapture {
-    url: url::Url,
-    output: Option<PathBuf>,
-    opts: Opts,
+pub(crate) struct PreparedCapture {
+    pub(crate) url: url::Url,
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) session: Option<String>,
+    pub(crate) opts: Opts,
+}
+
+/// Workflow recipes convert into capture requests so CLI files, MCP calls,
+/// and CLI flags all validate through the same `prepare` path.
+impl From<crate::workflow::Recipe> for CaptureRequest {
+    fn from(recipe: crate::workflow::Recipe) -> Self {
+        Self {
+            url: recipe.url,
+            selector: recipe.selector,
+            padding: recipe.padding,
+            full_page: recipe.full,
+            size: recipe.size,
+            dark: false,
+            color_scheme: recipe.color_scheme,
+            format: recipe.format,
+            wait_ms: recipe.wait_ms,
+            wait_for: recipe.wait_for,
+            scale: recipe.scale,
+            timeout_seconds: recipe.timeout_seconds,
+            output: Some(recipe.output),
+            steps: Some(recipe.steps),
+            redact: Some(recipe.redact),
+            mask_blur_px: recipe.mask_blur_px,
+            redact_patterns: Some(recipe.redact_patterns),
+            annotations: Some(
+                recipe
+                    .annotations
+                    .into_iter()
+                    .map(|point| AnnotationRequest {
+                        selector: point.selector,
+                        label: point.label,
+                    })
+                    .collect(),
+            ),
+            highlight: Some(recipe.highlight),
+            dim: recipe.dim,
+            session: recipe.session,
+        }
+    }
 }
 
 impl CaptureRequest {
-    fn prepare(self) -> Result<PreparedCapture> {
+    pub(crate) fn prepare(self) -> Result<PreparedCapture> {
         let url = normalize_url(self.url.trim())?;
         let selector_supplied = self.selector.is_some();
         let selector = self
@@ -123,6 +263,112 @@ impl CaptureRequest {
         if wait_for_supplied && wait_for.is_none() {
             bail!("wait_for must not be empty");
         }
+        let session_supplied = self.session.is_some();
+        let session = self
+            .session
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty());
+        if session_supplied && session.is_none() {
+            bail!("session must not be empty");
+        }
+        if let Some(name) = &session {
+            crate::capture::validate_session_name(name)?;
+        }
+
+        let annotations = self
+            .annotations
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, point)| {
+                let selector = point.selector.trim().to_owned();
+                let label = point.label.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("annotations[{i}].selector must not be empty");
+                }
+                if label.is_empty() {
+                    bail!("annotations[{i}].label must not be empty");
+                }
+                Ok(crate::capture::Annotation {
+                    selector,
+                    label,
+                    number: i as u32 + 1,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let highlights = self
+            .highlight
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| {
+                let selector = selector.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("highlight[{i}] must not be empty");
+                }
+                Ok(selector)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let steps = self
+            .steps
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, step)| {
+                let at = format!("steps[{i}]");
+                let non_empty = |value: String, field: &str| {
+                    let value = value.trim().to_owned();
+                    if value.is_empty() {
+                        bail!("{at}.{field} must not be empty");
+                    }
+                    Ok(value)
+                };
+                match step {
+                    StepRequest::Click { click } => Ok(crate::capture::InteractionStep::Click {
+                        selector: non_empty(click, "click")?,
+                    }),
+                    StepRequest::Open { open } => Ok(crate::capture::InteractionStep::Click {
+                        selector: non_empty(open, "open")?,
+                    }),
+                    StepRequest::Fill { fill, text } => Ok(crate::capture::InteractionStep::Fill {
+                        selector: non_empty(fill, "fill")?,
+                        text: text.trim().to_owned(),
+                    }),
+                    StepRequest::Hover { hover } => Ok(crate::capture::InteractionStep::Hover {
+                        selector: non_empty(hover, "hover")?,
+                    }),
+                    StepRequest::Press { press } => Ok(crate::capture::InteractionStep::Press {
+                        key: non_empty(press, "press")?,
+                    }),
+                    StepRequest::WaitFor { wait_for } => {
+                        Ok(crate::capture::InteractionStep::WaitFor {
+                            selector: non_empty(wait_for, "wait_for")?,
+                        })
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let masks = self
+            .redact
+            .unwrap_or_default()
+            .into_iter()
+            .enumerate()
+            .map(|(i, selector)| {
+                let selector = selector.trim().to_owned();
+                if selector.is_empty() {
+                    bail!("redact[{i}] must not be empty");
+                }
+                Ok(selector)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mask_patterns = self
+            .redact_patterns
+            .unwrap_or_default()
+            .into_iter()
+            .map(RedactPattern::capture_pattern)
+            .collect();
 
         let mut format = self
             .format
@@ -137,17 +383,32 @@ impl CaptureRequest {
                 .ok_or_else(|| anyhow!("unsupported output extension: .{extension}"))?;
         }
 
+        let color_scheme = match (self.color_scheme, self.dark) {
+            (Some(scheme), false) => scheme.capture_scheme(),
+            (Some(_), true) => bail!("dark conflicts with color_scheme"),
+            (None, true) => crate::capture::ColorScheme::Dark,
+            (None, false) => crate::capture::ColorScheme::System,
+        };
+
         Ok(PreparedCapture {
             url,
             output: self.output,
+            session,
             opts: Opts {
                 viewport,
                 mode,
-                dark: self.dark,
+                color_scheme,
                 wait_ms: self.wait_ms,
                 wait_for,
                 timeout: Duration::from_secs(timeout_seconds),
                 format,
+                annotations,
+                highlights,
+                dim: self.dim,
+                steps,
+                masks,
+                mask_blur_px: self.mask_blur_px,
+                mask_patterns,
             },
         })
     }
@@ -155,61 +416,78 @@ impl CaptureRequest {
 
 struct McpState {
     chrome: Option<PathBuf>,
-    session: Mutex<Option<Arc<Session>>>,
+    sessions: Mutex<std::collections::HashMap<String, Arc<Session>>>,
     permits: Semaphore,
 }
+
+/// Cache key for the default temp-profile session.
+const DEFAULT_SESSION: &str = "";
 
 impl McpState {
     fn new(chrome: Option<PathBuf>) -> Self {
         Self {
             chrome,
-            session: Mutex::new(None),
+            sessions: Mutex::new(std::collections::HashMap::new()),
             permits: Semaphore::new(4),
         }
     }
 
-    async fn session(&self) -> Result<Arc<Session>> {
-        let mut session = self.session.lock().await;
-        if session
-            .as_ref()
+    async fn session(&self, name: Option<&str>) -> Result<Arc<Session>> {
+        let key = name.unwrap_or(DEFAULT_SESSION).to_owned();
+        let mut sessions = self.sessions.lock().await;
+        if sessions
+            .get(&key)
             .is_some_and(|session| !session.is_healthy())
         {
-            session.take();
+            sessions.remove(&key);
         }
-        if let Some(session) = session.as_ref() {
+        if let Some(session) = sessions.get(&key) {
             return Ok(Arc::clone(session));
         }
-        let launched = Arc::new(Session::launch(self.chrome.clone(), Viewport::desktop()).await?);
-        *session = Some(Arc::clone(&launched));
+        let launched = if key.is_empty() {
+            Arc::new(Session::launch(self.chrome.clone(), Viewport::desktop()).await?)
+        } else {
+            let dir = crate::capture::resolve_session_dir(&key)?;
+            Arc::new(
+                Session::launch_with_profile(self.chrome.clone(), Viewport::desktop(), dir).await?,
+            )
+        };
+        sessions.insert(key, Arc::clone(&launched));
         Ok(launched)
     }
 
-    async fn capture(&self, url: &str, opts: &Opts) -> Result<CapturedImage> {
+    async fn capture(
+        &self,
+        session_name: Option<&str>,
+        url: &str,
+        opts: &Opts,
+    ) -> Result<CapturedImage> {
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| anyhow!("capture queue closed"))?;
-        let session = self.session().await?;
+        let session = self.session(session_name).await?;
         let result = session.capture(url, opts).await;
         if result.is_err() && !session.is_healthy() {
-            let mut current = self.session.lock().await;
+            let mut current = self.sessions.lock().await;
+            let key = session_name.unwrap_or(DEFAULT_SESSION);
             if current
-                .as_ref()
+                .get(key)
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &session))
             {
-                current.take();
+                current.remove(key);
             }
         }
         result
     }
 
     async fn close(&self) {
-        let session = self.session.lock().await.take();
-        if let Some(session) = session
-            && let Ok(session) = Arc::try_unwrap(session)
-        {
-            session.close().await;
+        let sessions = std::mem::take(&mut *self.sessions.lock().await);
+        for (_, session) in sessions {
+            if let Ok(session) = Arc::try_unwrap(session) {
+                session.close().await;
+            }
         }
     }
 }
@@ -236,7 +514,11 @@ impl IrisServer {
 
         let image = match self
             .state
-            .capture(prepared.url.as_str(), &prepared.opts)
+            .capture(
+                prepared.session.as_deref(),
+                prepared.url.as_str(),
+                &prepared.opts,
+            )
             .await
         {
             Ok(image) => image,
@@ -256,6 +538,8 @@ impl IrisServer {
             &prepared.opts.mode,
             prepared.opts.format,
             &image.shot,
+            prepared.opts.annotations.len(),
+            prepared.opts.color_scheme,
         );
         let structured = match serde_json::to_value(&report) {
             Ok(structured) => structured,
@@ -398,7 +682,16 @@ mod tests {
             wait_for: None,
             scale: None,
             timeout_seconds: None,
+            color_scheme: None,
+            session: None,
             output: None,
+            annotations: None,
+            highlight: None,
+            dim: false,
+            steps: None,
+            redact: None,
+            mask_blur_px: None,
+            redact_patterns: None,
         }
     }
 
@@ -431,6 +724,310 @@ mod tests {
                 .to_string()
                 .contains("padding requires selector")
         );
+    }
+
+    #[test]
+    fn annotation_requests_are_numbered_and_validated() {
+        let mut capture = request("example.com");
+        capture.annotations = Some(vec![
+            AnnotationRequest {
+                selector: " #search ".into(),
+                label: " Find ".into(),
+            },
+            AnnotationRequest {
+                selector: "#run-analysis".into(),
+                label: "Run".into(),
+            },
+        ]);
+        capture.highlight = Some(vec![" #hero ".into()]);
+        capture.dim = true;
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(
+            prepared.opts.annotations,
+            vec![
+                crate::capture::Annotation {
+                    selector: "#search".into(),
+                    label: "Find".into(),
+                    number: 1,
+                },
+                crate::capture::Annotation {
+                    selector: "#run-analysis".into(),
+                    label: "Run".into(),
+                    number: 2,
+                },
+            ]
+        );
+        assert_eq!(prepared.opts.highlights, vec!["#hero"]);
+        assert!(prepared.opts.dim);
+
+        let mut empty_label = request("example.com");
+        empty_label.annotations = Some(vec![AnnotationRequest {
+            selector: "#search".into(),
+            label: "  ".into(),
+        }]);
+        assert!(
+            empty_label
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("annotations[0].label must not be empty")
+        );
+
+        let mut empty_highlight = request("example.com");
+        empty_highlight.highlight = Some(vec!["  ".into()]);
+        assert!(
+            empty_highlight
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("highlight[0] must not be empty")
+        );
+    }
+
+    #[test]
+    fn step_requests_keep_array_order_and_reject_empties() {
+        let mut capture = request("example.com");
+        capture.steps = Some(vec![
+            StepRequest::Click {
+                click: " text=Conditions ".into(),
+            },
+            StepRequest::Open {
+                open: "#drawer".into(),
+            },
+            StepRequest::Fill {
+                fill: "#search".into(),
+                text: "asthma".into(),
+            },
+            StepRequest::Hover {
+                hover: "#menu".into(),
+            },
+            StepRequest::Press {
+                press: "Enter".into(),
+            },
+            StepRequest::WaitFor {
+                wait_for: "[role=dialog]".into(),
+            },
+        ]);
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(
+            prepared.opts.steps,
+            vec![
+                crate::capture::InteractionStep::Click {
+                    selector: "text=Conditions".into(),
+                },
+                crate::capture::InteractionStep::Click {
+                    selector: "#drawer".into(),
+                },
+                crate::capture::InteractionStep::Fill {
+                    selector: "#search".into(),
+                    text: "asthma".into(),
+                },
+                crate::capture::InteractionStep::Hover {
+                    selector: "#menu".into(),
+                },
+                crate::capture::InteractionStep::Press {
+                    key: "Enter".into()
+                },
+                crate::capture::InteractionStep::WaitFor {
+                    selector: "[role=dialog]".into(),
+                },
+            ]
+        );
+
+        let mut empty = request("example.com");
+        empty.steps = Some(vec![StepRequest::Click { click: "  ".into() }]);
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("steps[0].click must not be empty")
+        );
+    }
+
+    #[test]
+    fn redact_requests_map_selectors_blur_and_patterns() {
+        let mut capture = request("example.com");
+        capture.redact = Some(vec![" .client-name ".into(), "[data-private]".into()]);
+        capture.mask_blur_px = Some(8);
+        capture.redact_patterns = Some(vec![RedactPattern::Email, RedactPattern::Account]);
+        let prepared = capture.prepare().unwrap();
+        assert_eq!(prepared.opts.masks, vec![".client-name", "[data-private]"]);
+        assert_eq!(prepared.opts.mask_blur_px, Some(8));
+        assert_eq!(
+            prepared.opts.mask_patterns,
+            vec![
+                crate::capture::MaskPattern::Email,
+                crate::capture::MaskPattern::Account,
+            ]
+        );
+
+        let mut empty = request("example.com");
+        empty.redact = Some(vec!["  ".into()]);
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("redact[0] must not be empty")
+        );
+
+        let unknown: Result<CaptureRequest, _> = serde_json::from_value(serde_json::json!({
+            "url": "example.com",
+            "redact_patterns": ["passport"],
+        }));
+        assert!(unknown.is_err());
+    }
+
+    #[test]
+    fn color_scheme_requests_map_with_dark_back_compat() {
+        let plain = request("example.com").prepare().unwrap();
+        assert_eq!(plain.opts.color_scheme, crate::capture::ColorScheme::System);
+
+        let mut dark = request("example.com");
+        dark.dark = true;
+        assert_eq!(
+            dark.prepare().unwrap().opts.color_scheme,
+            crate::capture::ColorScheme::Dark
+        );
+
+        let mut light = request("example.com");
+        light.color_scheme = Some(ColorSchemeRequest::Light);
+        assert_eq!(
+            light.prepare().unwrap().opts.color_scheme,
+            crate::capture::ColorScheme::Light
+        );
+
+        let mut clash = request("example.com");
+        clash.dark = true;
+        clash.color_scheme = Some(ColorSchemeRequest::Light);
+        assert!(
+            clash
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("dark conflicts with color_scheme")
+        );
+    }
+
+    #[test]
+    fn session_requests_are_trimmed_and_validated() {
+        let plain = request("example.com").prepare().unwrap();
+        assert_eq!(plain.session, None);
+
+        let mut named = request("example.com");
+        named.session = Some(" matteros ".into());
+        assert_eq!(
+            named.prepare().unwrap().session.as_deref(),
+            Some("matteros")
+        );
+
+        let mut empty = request("example.com");
+        empty.session = Some("  ".into());
+        assert!(
+            empty
+                .prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("session must not be empty")
+        );
+
+        let mut evil = request("example.com");
+        evil.session = Some("../evil".into());
+        assert!(
+            evil.prepare()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid session name")
+        );
+    }
+
+    #[test]
+    fn recipe_and_request_with_same_values_prepare_identically() {
+        let recipe: crate::workflow::Recipe = serde_saphyr::from_str(
+            r##"
+url: example.com
+size: 800x600
+scale: 1.5
+selector: "#main"
+padding: 10
+color_scheme: dark
+session: matteros
+format: jpg
+wait_ms: 100
+wait_for: "#ready"
+timeout_seconds: 12
+steps:
+  - click: "#open"
+  - {fill: "#q", text: "hi"}
+  - hover: "#menu"
+  - press: Enter
+  - wait_for: "#done"
+redact: ["[data-private]"]
+mask_blur_px: 4
+redact_patterns: [email, ssn]
+annotations:
+  - selector: "#q"
+    label: Type here
+highlight: ["#go"]
+dim: true
+output: shots/all.png
+"##,
+        )
+        .unwrap();
+        let from_recipe = CaptureRequest::from(recipe).prepare().unwrap();
+        let from_request = CaptureRequest {
+            url: "example.com".into(),
+            selector: Some("#main".into()),
+            padding: Some(10),
+            full_page: false,
+            size: Some("800x600".into()),
+            dark: false,
+            color_scheme: Some(ColorSchemeRequest::Dark),
+            format: Some(ImageFormat::Jpg),
+            wait_ms: 100,
+            wait_for: Some("#ready".into()),
+            scale: Some(1.5),
+            timeout_seconds: Some(12),
+            output: Some(PathBuf::from("shots/all.png")),
+            steps: Some(vec![
+                StepRequest::Click {
+                    click: "#open".into(),
+                },
+                StepRequest::Fill {
+                    fill: "#q".into(),
+                    text: "hi".into(),
+                },
+                StepRequest::Hover {
+                    hover: "#menu".into(),
+                },
+                StepRequest::Press {
+                    press: "Enter".into(),
+                },
+                StepRequest::WaitFor {
+                    wait_for: "#done".into(),
+                },
+            ]),
+            redact: Some(vec!["[data-private]".into()]),
+            mask_blur_px: Some(4),
+            redact_patterns: Some(vec![RedactPattern::Email, RedactPattern::Ssn]),
+            annotations: Some(vec![AnnotationRequest {
+                selector: "#q".into(),
+                label: "Type here".into(),
+            }]),
+            highlight: Some(vec!["#go".into()]),
+            dim: true,
+            session: Some("matteros".into()),
+        }
+        .prepare()
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", from_recipe.opts),
+            format!("{:?}", from_request.opts)
+        );
+        assert_eq!(from_recipe.url, from_request.url);
+        assert_eq!(from_recipe.output, from_request.output);
+        assert_eq!(from_recipe.session, from_request.session);
     }
 
     #[test]
