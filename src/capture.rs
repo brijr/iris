@@ -382,7 +382,7 @@ impl Session {
         page.goto(url).await?;
         page.wait_for_navigation().await?;
 
-        self.eval(page, SETTLE_JS.into()).await?;
+        self.eval(page, settle_js(false)).await?;
         if let Some(selector) = &opts.wait_for {
             // Undercut the outer timeout so the descriptive selector error surfaces
             // instead of a generic "timed out".
@@ -410,12 +410,12 @@ impl Session {
                 .await?;
                 // Scrolling can start image loads, IntersectionObservers, and
                 // entrance transitions that the initial settle could not see.
-                self.eval(page, SETTLE_JS.into()).await?;
+                self.eval(page, settle_js(false)).await?;
             }
         }
         if opts.wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(opts.wait_ms)).await;
-            self.eval(page, SETTLE_JS.into()).await?;
+            self.eval(page, settle_js(false)).await?;
         }
 
         let screenshot_params = || {
@@ -434,40 +434,40 @@ impl Session {
                 page.screenshot(screenshot_params().build()).await?,
             ),
             CaptureMode::FullPage => {
+                self.eval(page, settle_js(true)).await?;
                 let doc_h = self
                     .eval_u32(page, DOC_HEIGHT_JS)
                     .await
                     .unwrap_or(v.height)
                     .max(v.height);
-                if doc_h as f64 * v.scale <= 16_000.0 {
-                    // Retina full page: grow the viewport to the whole document so the
-                    // scale factor still applies (CDP's captureBeyondViewport renders at 1x).
-                    page.execute(
-                        SetDeviceMetricsOverrideParams::builder()
-                            .width(v.width as i64)
-                            .height(doc_h as i64)
-                            .device_scale_factor(v.scale)
-                            .mobile(v.mobile)
-                            .build()
-                            .map_err(|e| anyhow!(e))?,
-                    )
-                    .await?;
-                    self.eval(page, SETTLE_JS.into()).await?;
-                    (
-                        v.width,
-                        doc_h,
-                        v.scale,
-                        page.screenshot(screenshot_params().build()).await?,
-                    )
+                // Clip the whole document instead of growing the viewport to it, so
+                // 100vh sections keep their height. The clip keeps the Retina scale
+                // factor up to Chrome's ~16k px render limit, then falls back to 1x.
+                let scale = if doc_h as f64 * v.scale <= 16_000.0 {
+                    v.scale
                 } else {
-                    (
-                        v.width,
-                        doc_h,
-                        1.0,
-                        page.screenshot(screenshot_params().full_page(true).build())
-                            .await?,
+                    1.0
+                };
+                let clip = ScreenshotViewport::builder()
+                    .x(0.0)
+                    .y(0.0)
+                    .width(v.width as f64)
+                    .height(doc_h as f64)
+                    .scale(scale / v.scale)
+                    .build()
+                    .map_err(|e| anyhow!(e))?;
+                (
+                    v.width,
+                    doc_h,
+                    scale,
+                    page.screenshot(
+                        screenshot_params()
+                            .clip(clip)
+                            .capture_beyond_viewport(true)
+                            .build(),
                     )
-                }
+                    .await?,
+                )
             }
             CaptureMode::Element { selector, padding } => {
                 let value = self.eval(page, element_bounds_js(selector)).await?;
@@ -642,11 +642,12 @@ fn find_chrome() -> Option<PathBuf> {
 /// then any running finite animations/transitions — entrance fade-ins — allowed
 /// to finish (3s cap; infinite loops are skipped, they never settle). Off-screen
 /// images are ignored: they don't appear in the capture, and lazy-loaded ones
-/// would stall the wait forever. Full-page captures grow the viewport to the
-/// whole document before the final settle, so everything counts as near there.
-const SETTLE_JS: &str = r#"(async () => {
+/// would stall the wait forever. Full-page captures settle the whole document
+/// before the screenshot, so every image counts as near there.
+const SETTLE_JS: &str = r#"async (wholeDocument) => {
   if (document.fonts) { try { await document.fonts.ready; } catch {} }
   const near = (img) => {
+    if (wholeDocument) return true;
     const r = img.getBoundingClientRect();
     return r.top < innerHeight * 1.5 && r.bottom > -innerHeight * 0.5;
   };
@@ -668,7 +669,11 @@ const SETTLE_JS: &str = r#"(async () => {
     new Promise(r => setTimeout(r, 3000)),
   ]);
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-})()"#;
+}"#;
+
+fn settle_js(whole_document: bool) -> String {
+    format!("({SETTLE_JS})({whole_document})")
+}
 
 /// Step-scroll to the bottom so IntersectionObserver lazy-loading fires, then back to top.
 const SCROLL_JS: &str = r#"(async () => {
@@ -899,6 +904,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_page_capture_keeps_viewport_relative_heights() -> Result<()> {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/full-page-layout.html")
+            .canonicalize()?;
+        let url = url::Url::from_file_path(&fixture)
+            .map_err(|_| anyhow!("fixture path is not a file URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::FullPage, false),
+            )
+            .await;
+        session.close().await;
+        let capture = capture?;
+
+        // A 100vh header, 900px main, and 100px footer make a 1240px page.
+        assert_eq!(
+            (capture.shot.width, capture.shot.height, capture.shot.scale),
+            (320, 1240, 2.0)
+        );
+        let (width, height, pixel) = decode_png(&capture.data);
+        assert_eq!((width, height), (640, 2480));
+        // The header stays one viewport (240px, 480 device pixels) tall.
+        assert_eq!(pixel(320, 479), [22, 78, 154]);
+        assert_eq!(pixel(320, 480), [233, 138, 34]);
+        assert_eq!(pixel(320, 2479), [39, 133, 74]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_element_capture_contract() -> Result<()> {
         let temp = std::env::temp_dir().join(format!("iris-browser-{}", std::process::id()));
         tokio::fs::create_dir_all(&temp).await?;
@@ -1075,6 +1117,20 @@ mod tests {
         let image = session.capture(url, opts).await?;
         image.write_to(path).await?;
         Ok(image.shot)
+    }
+
+    fn decode_png(bytes: &[u8]) -> (u32, u32, impl Fn(usize, usize) -> [u8; 3]) {
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        let channels = info.color_type.samples();
+        let pixel = move |x: usize, y: usize| {
+            let at = y * info.line_size + x * channels;
+            [buf[at], buf[at + 1], buf[at + 2]]
+        };
+        (info.width, info.height, pixel)
     }
 
     fn png_dimensions(bytes: &[u8]) -> (u32, u32) {
