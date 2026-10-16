@@ -1,0 +1,51 @@
+{
+  "run": "https://github.com/aktanazat/iris/actions/runs/35725521554",
+  "baseline_commit": "227d3109be29c87c2bed85d214c122795a640210",
+  "candidate_binary_sha256": "1e2b4839764588decaf7d809bdad2c9524e93a2b13991d603897944d763301bb",
+  "system": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "chrome": "152.0.7977.83",
+  "method": "One fresh MCP server per run. Measure from capture request to complete response. First capture is separate from the ten subsequent warm captures. All four commands exited 0.",
+  "capture": {
+    "fixture": "tests/fixtures/precise-capture.html",
+    "selector": ".capture-target",
+    "padding": 10,
+    "size": "320x240",
+    "scale": 1,
+    "format": "png",
+    "timeout_seconds": 30,
+    "decoded_width": 141,
+    "decoded_height": 81
+  },
+  "runs": [
+    {
+      "label": "baseline-a",
+      "first_ms": 5693.806,
+      "warm_ms": [1369.315, 1080.249, 1059.016, 1252.061, 1137.677, 1054.079, 1261.106, 979.53, 948.367, 717.126]
+    },
+    {
+      "label": "candidate-a",
+      "first_ms": 2488.757,
+      "warm_ms": [547.263, 606.339, 616.116, 618.652, 624.265, 572.997, 528.598, 460.88, 624.339, 689.279]
+    },
+    {
+      "label": "candidate-b",
+      "first_ms": 2199.247,
+      "warm_ms": [653.233, 642.993, 579.069, 536.663, 546.382, 573.03, 635.321, 963.811, 707.962, 558.141]
+    },
+    {
+      "label": "baseline-b",
+      "first_ms": 2097.308,
+      "warm_ms": [1159.602, 897.696, 857.371, 1086.449, 1021.004, 1128.011, 689.528, 1065.104, 920.49, 966.771]
+    }
+  ],
+  "summary": {
+    "warm_population_per_version": 20,
+    "baseline_warm_median_ms": 1056.5475,
+    "candidate_warm_median_ms": 611.2275,
+    "baseline_warm_p95_ms": 1261.106,
+    "candidate_warm_p95_ms": 707.962,
+    "p95_method": "nearest rank over the combined twenty warm samples per version",
+    "warm_median_reduction_percent": 42.14860193223685,
+    "limitation": "One fixture on one runner. First-capture times varied and do not establish a reliable startup improvement."
+  }
+}

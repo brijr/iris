@@ -1,0 +1,13 @@
+id: anti-slop-rust-no-transmute
+language: rust
+severity: error
+message: Do not use `mem::transmute`/`transmute_copy` to reinterpret bytes.
+note: |
+  `transmute` bypasses every layout and validity check the compiler has.
+  Use a safe conversion (`From`/`TryFrom`, `to_ne_bytes`/`from_ne_bytes`,
+  `as` between numeric types, or a checked cast crate) instead.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '(^|::)transmute(_copy)?$'

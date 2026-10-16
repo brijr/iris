@@ -1,0 +1,25 @@
+id: anti-slop-rust-no-unsafe-dictionary-type
+language: rust
+severity: error
+message: Do not use a map keyed to `Value` or `Box<dyn Any>` as a value type.
+note: |
+  Same problem as TypeScript's `Record<string, unknown>`: the map's value type
+  claims nothing. Define a struct for the fields you actually read, or an enum
+  for the closed set of shapes the map can hold.
+rule:
+  all:
+    - kind: generic_type
+    - has:
+        field: type
+        regex: '(^|::)(HashMap|BTreeMap)$'
+    - has:
+        field: type_arguments
+        has:
+          stopBy: end
+          any:
+            - kind: type_identifier
+              regex: '^Value$'
+            - kind: scoped_type_identifier
+              regex: '(^|::)Value$'
+            - kind: dynamic_type
+              regex: 'Any'

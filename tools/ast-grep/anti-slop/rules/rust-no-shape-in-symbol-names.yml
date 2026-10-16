@@ -1,0 +1,31 @@
+id: anti-slop-rust-no-shape-in-symbol-names
+language: rust
+severity: error
+message: Rename this symbol for its domain role instead of its container shape.
+note: |
+  A `_map`/`_vec`/`_string`/`_obj`/`_arr` suffix describes the container, not
+  what the value means. Rename for ownership (`users`, `config`, `pending`);
+  the type annotation already says it's a `HashMap` or `Vec`. Scoped to
+  declaration sites (`let` bindings, parameters, struct fields) rather than
+  every identifier, because Rust's own stdlib uses these suffixes as verbs
+  (`to_string`, `to_vec`, `flat_map`, `filter_map`), not as shape nouns.
+rule:
+  any:
+    - all:
+        - kind: identifier
+        - regex: '_(map|vec|string|obj|arr)$'
+        - inside:
+            kind: let_declaration
+            field: pattern
+    - all:
+        - kind: identifier
+        - regex: '_(map|vec|string|obj|arr)$'
+        - inside:
+            kind: parameter
+            field: pattern
+    - all:
+        - kind: field_identifier
+        - regex: '_(map|vec|string|obj|arr)$'
+        - inside:
+            kind: field_declaration
+            field: name

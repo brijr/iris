@@ -1,0 +1,36 @@
+id: anti-slop-rust-no-leftover-panic-markers
+language: rust
+severity: error
+message: Remove this leftover `todo!`/`unimplemented!`/`dbg!` marker before shipping.
+note: |
+  These are development scaffolding, not a finished implementation. Finish
+  the branch, return a real `Result`/`Option`, or use `tracing`/`log` instead
+  of `dbg!`. Test code is exempt.
+rule:
+  all:
+    - kind: macro_invocation
+    - has:
+        field: macro
+        regex: '^(todo|unimplemented|dbg)$'
+    - not:
+        inside:
+          stopBy: end
+          any:
+            - all:
+                - kind: function_item
+                - follows:
+                    kind: attribute_item
+                    stopBy: neighbor
+                    has:
+                      kind: attribute
+                      has:
+                        kind: identifier
+                        regex: '^test$'
+            - all:
+                - kind: mod_item
+                - follows:
+                    kind: attribute_item
+                    stopBy: neighbor
+                    has:
+                      kind: attribute
+                      regex: 'cfg\s*\(\s*test\s*\)'

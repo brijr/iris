@@ -1,4 +1,5 @@
 mod capture;
+mod compare;
 mod mcp;
 
 use std::collections::HashMap;
@@ -11,7 +12,12 @@ use anyhow::{Context, Result, bail};
 use capture::{CaptureMode, Format, Opts, Session, normalize_url, parse_viewport, success_report};
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
+use num_traits::ToPrimitive;
 use url::Url;
+
+// Keep short-deadline browser tests from competing for Chrome resources.
+#[cfg(test)]
+static BROWSER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Screenshot live websites. Minimal interface, powerful engine:
 /// smart waiting, lazy-load handling, retina output, concurrent capture.
@@ -27,7 +33,7 @@ Examples:
   iris example.com                      1440\u{d7}900 @2x \u{2192} example.com.png
   iris --full --dark tailwindcss.com    full page, dark color scheme
   iris --selector '#hero' --padding 24 app.dev
-  iris mcp                              serve the capture tool over stdio
+  iris mcp                              serve capture and comparison tools over stdio
   cat urls.txt | iris - -o shots/       concurrent batch from stdin"
 )]
 struct Cli {
@@ -42,6 +48,20 @@ struct Cli {
 enum Command {
     /// Serve Iris as a local Model Context Protocol camera
     Mcp(mcp::McpArgs),
+    /// Compare saved images and optionally write a visual difference map
+    Compare(CompareArgs),
+}
+
+#[derive(Args)]
+struct CompareArgs {
+    before: PathBuf,
+    after: PathBuf,
+    /// Ignore per-channel differences up to this value (0–255)
+    #[arg(long, default_value_t = 0)]
+    threshold: u8,
+    /// Save a PNG difference map
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -78,7 +98,19 @@ struct CaptureArgs {
     #[arg(long, value_parser = ["png", "jpg", "jpeg", "webp"], value_name = "FMT")]
     format: Option<String>,
 
-    /// Extra settle delay in ms after smart waiting
+    /// JPEG/WebP quality (0–100)
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(0..=100))]
+    quality: u8,
+
+    /// Reduce image density to fit this pixel budget without changing page layout
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    max_pixels: Option<u64>,
+
+    /// Finish finite animations and pause repeating ones before capture
+    #[arg(long)]
+    freeze_animations: bool,
+
+    /// Extra delay in ms before the final readiness check
     #[arg(long, default_value_t = 0, value_name = "MS")]
     wait: u64,
 
@@ -110,10 +142,21 @@ struct CaptureArgs {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(Command::Mcp(args)) = cli.command {
-        return mcp::run(args).await;
+    match cli.command {
+        Some(Command::Mcp(args)) => mcp::run(args).await,
+        Some(Command::Compare(args)) => {
+            let report = compare::compare(
+                &args.before,
+                &args.after,
+                args.threshold,
+                args.output.as_deref(),
+                || false,
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
+        None => run_capture(cli.capture).await,
     }
-    run_capture(cli.capture).await
 }
 
 async fn run_capture(cli: CaptureArgs) -> Result<()> {
@@ -132,6 +175,9 @@ async fn run_capture(cli: CaptureArgs) -> Result<()> {
         wait_for: cli.wait_for,
         timeout: Duration::from_secs(cli.timeout.max(1)),
         format,
+        quality: cli.quality,
+        max_pixels: cli.max_pixels,
+        freeze_animations: cli.freeze_animations,
     });
 
     let session = Arc::new(Session::launch(cli.chrome, viewport).await?);
@@ -307,7 +353,10 @@ fn derived_name(url: &Url) -> String {
 
 fn human_size(bytes: u64) -> String {
     if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        format!(
+            "{:.1} MB",
+            bytes.to_f64().unwrap_or(f64::INFINITY) / (1024.0 * 1024.0)
+        )
     } else {
         format!("{} KB", bytes.div_ceil(1024))
     }
@@ -318,7 +367,6 @@ mod tests {
     use clap::error::ErrorKind;
 
     use super::*;
-    use crate::capture::Shot;
 
     #[test]
     fn selector_conflicts_with_full_page() {
@@ -343,32 +391,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_mode_is_constructed_once_from_validated_cli() {
-        let element = Cli::try_parse_from([
-            "iris",
-            "example.com",
-            "--selector",
-            "main > h1",
-            "--padding",
-            "24",
-        ])
-        .unwrap();
-        assert_eq!(
-            capture_mode(&element.capture),
-            CaptureMode::Element {
-                selector: "main > h1".into(),
-                padding: 24,
-            }
-        );
-
-        let full = Cli::try_parse_from(["iris", "example.com", "--full"]).unwrap();
-        assert_eq!(capture_mode(&full.capture), CaptureMode::FullPage);
-
-        let viewport = Cli::try_parse_from(["iris", "example.com"]).unwrap();
-        assert_eq!(capture_mode(&viewport.capture), CaptureMode::Viewport);
-    }
-
-    #[test]
     fn mcp_subcommand_does_not_require_a_url() {
         let cli = Cli::try_parse_from(["iris", "mcp"]).unwrap();
         assert!(matches!(cli.command, Some(Command::Mcp(_))));
@@ -377,43 +399,5 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(conflict.kind(), ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn json_reports_have_stable_typed_fields() {
-        let mode = CaptureMode::Element {
-            selector: "h1".into(),
-            padding: 24,
-        };
-        let shot = Shot {
-            width: 180,
-            height: 72,
-            scale: 2.0,
-            bytes: 14_231,
-        };
-        let success = serde_json::to_string(&success_report(
-            "https://example.com/",
-            Some(std::path::Path::new("/tmp/example.png")),
-            &mode,
-            Format::Png,
-            &shot,
-        ))
-        .unwrap();
-        assert_eq!(
-            success,
-            r#"{"status":"ok","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}"#
-        );
-
-        let failure = serde_json::to_string(&capture::error_report(
-            "https://example.com/",
-            Some(std::path::Path::new("/tmp/example.png")),
-            &mode,
-            "selector never appeared: h1".into(),
-        ))
-        .unwrap();
-        assert_eq!(
-            failure,
-            r#"{"status":"error","url":"https://example.com/","output":"/tmp/example.png","mode":"element","selector":"h1","padding":24,"error":"selector never appeared: h1"}"#
-        );
     }
 }

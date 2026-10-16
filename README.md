@@ -2,7 +2,7 @@
 
 <img width="1448" height="1086" alt="ChatGPT Image Aug 18, 2026, 12_50_00 PM" src="https://github.com/user-attachments/assets/9acb5597-afea-41ed-b4a1-63195c2ce662" />
 
-A camera for coding agents. One fast command or MCP tool call produces one trustworthy image.
+A camera for coding agents. Capture pages, compare saved images, and inspect capture readiness without adding a model call.
 
 ```
 iris example.com                        # 1440×900 @2x → example.com.png
@@ -13,6 +13,9 @@ iris -o shots/ a.com b.com c.com        # batch, captured concurrently
 cat urls.txt | iris - -o shots/         # batch from stdin (# comments ok)
 iris -o hero.jpg --wait-for 'h1' app.dev
 iris --selector 'h1' --json app.dev      # machine-readable JSON Lines
+iris --full --max-pixels 1500000 app.dev # lower density, unchanged page layout
+iris --freeze-animations app.dev        # finish entrances and pause loops
+iris compare before.png after.png -o diff.png
 ```
 
 `iris --full bridger.to` →
@@ -33,7 +36,7 @@ cargo install iris-screenshot
 
 The crates.io package is named `iris-screenshot`; the installed command is `iris`.
 
-The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, or Brave).
+The only runtime dependency is an installed Chrome-family browser (Chrome, Chromium, Edge, Brave, or Helium). For any other Chromium build, set `CHROME=/path/to/browser` or pass `--chrome`.
 Building from source requires Rust 1.88 or newer.
 
 ## Give your coding agent eyes
@@ -57,7 +60,13 @@ Or use the equivalent configuration in another MCP client:
 }
 ```
 
-The server exposes one tool, `capture`, which returns the image inline with structured metadata. It writes nothing by default; pass `output` when the agent also needs a file.
+The server exposes three tools:
+
+- `capture` returns one image inline with structured metadata. It writes nothing unless `output` is supplied.
+- `capture_batch` accepts a `captures` array of 1–16 capture requests. Up to four run concurrently. Results stay in input order; a failed item does not discard successful images.
+- `compare` compares two saved PNG, JPEG, or WebP files. It returns changed-pixel counts and bounds, and can write a PNG difference image with `output`.
+
+All three run locally. They do not send images, page contents, or reports to an AI service.
 
 ```json
 {
@@ -74,7 +83,7 @@ The server exposes one tool, `capture`, which returns the image inline with stru
 
 Bare localhost, `.localhost`, and loopback addresses use HTTP automatically. Other bare hosts use HTTPS. Run `iris mcp --help` to select a Chrome binary for the server.
 
-MCP clients may need a fresh agent task before the newly registered `capture` tool appears.
+MCP clients may need to restart the server and refresh tool discovery before new tools or parameters appear.
 
 ## Setup Prompt
 
@@ -125,19 +134,19 @@ interaction scripting, or review tooling; use Iris only as the camera.
 ## What it does for you
 
 - Renders with your real installed Chrome, driven over the DevTools Protocol
-- Waits for fonts, image loads, entrance animations, and — on `--full` — scroll-triggers lazy-loaded content before capturing
+- Waits for fonts, image loads, and finite entrance animations under one shared three-second budget. Rendered-frame waits and full-page scrolling also count toward the capture timeout.
 - Captures the first matching element with `--selector`, automatically scrolling it into view and settling newly visible content before framing it
 - Serves the same capture engine to coding agents with `iris mcp`, returning pixels inline instead of making the agent locate a file
-- Retina `@2x` output by default; full pages taller than Chrome's ~16k px render limit fall back to `@1x` automatically (the report tells you which you got)
-- Image format from the `-o` extension or `--format`: `png` (default), `jpg`, `webp` (JPEG/WebP encode at quality 90)
-- One browser process, concurrent tabs; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)
+- Retina `@2x` output by default; full pages taller than Chrome's ~16k px render limit fall back to `@1x` automatically (the report tells you which you got); `--max-pixels` lowers output density without resizing the page
+- Image format from the `-o` extension or `--format`: `png` (default), `jpg`, `webp`; `--quality` controls JPEG/WebP encoding (0–100, default 90)
+- One browser process, concurrent headless windows; a failed URL prints `✗` and never kills the batch (exit code 1 if anything failed)
 - Batch filenames derive from the URL (`example.com-pricing.png`); collisions get `-2`, `-3` suffixes
 - `--json` writes one JSON object per completed capture to stdout, in concurrent completion order; capture failures are JSON too and still produce exit code 1
 
 Element capture is intentionally CSS-selector based: Iris captures the first match in document order. `--selector` conflicts with `--full`; `--padding` requires it. Cross-origin iframe contents and capturing every match are not supported.
 
 ```json
-{"status":"ok","url":"https://example.com/","output":"/absolute/example.com.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231}
+{"status":"ok","url":"https://example.com/","output":"/absolute/example.com.png","mode":"element","selector":"h1","padding":24,"css_width":180,"css_height":72,"scale":2.0,"format":"png","bytes":14231,"page":{"final_url":"https://example.com/","title":"Example","document_width":1440,"document_height":900,"pending_images":0,"failed_images":0,"fonts_pending":false,"running_animations":0},"timings":{"setup_ms":20,"navigation_ms":35,"ready_ms":100,"screenshot_ms":30,"total_ms":185},"warnings":[]}
 ```
 
 ## Benchmarking
@@ -166,6 +175,20 @@ Reference results (not a performance guarantee):
 
 All reference runs used the local `precise-capture.html` fixture, `.capture-target`, 24px padding, PNG, and scale 1. Record `iris --version`, the Chrome version, and the exact command with any published result.
 
+A separate before/after comparison used a GitHub-hosted ARM64 runner with macOS 26.6.2 and Chrome 152.0.7977.83. The baseline was upstream `main` at `227d3109`; the candidate adds the capture controls and agent workflows below.
+
+| MCP capture time | Before | After |
+| --- | ---: | ---: |
+| Warm median, 20 captures per version | 1,057 ms | 611 ms |
+| Warm p95, nearest rank | 1,261 ms | 708 ms |
+| First capture, two fresh servers per version | 5,694 / 2,097 ms | 2,489 / 2,199 ms |
+
+The run order was baseline, candidate, candidate, baseline. Each server captured the same local fixture once, then ten more times: `.capture-target`, 10px padding, a 320×240 viewport, PNG, scale 1, and a 30-second timeout. Every image decoded to 141×81 pixels.
+
+The warm median fell by 42%. First-capture times varied and do not establish a reliable startup improvement.
+
+[Raw timing samples](.github/capture-benchmark.json) retain the run order and capture settings. The linked workflow contains the command receipts.
+
 ## Flags
 
 ```
@@ -176,16 +199,37 @@ All reference runs used the local `precise-capture.html` fixture, `.capture-targ
     --padding <PX>     nonnegative CSS-pixel padding around a selected element
     --dark             emulate prefers-color-scheme: dark
     --format <FMT>     png | jpg | webp (a recognized --out extension wins)
-    --wait <MS>        extra settle delay after smart waiting
+    --quality <N>      JPEG/WebP quality, 0–100 (default: 90)
+    --max-pixels <N>   cap output pixels by lowering density, not resizing the page
+    --freeze-animations finish finite animations and pause repeating ones
+    --wait <MS>        extra delay before the final readiness check
     --wait-for <CSS>   wait until a selector exists before capturing
     --scale <N>        device scale factor (overrides the preset's)
     --jobs <N>         concurrent captures (default: min(4, URLs))
-    --timeout <SECS>   per-page budget (default: 30)
+    --timeout <SECS>   capture budget (default: 30; MCP includes queue and browser startup)
     --chrome <PATH>    browser binary (auto-detected; also via $CHROME)
     --json             emit one JSON object per completed capture
 ```
 
-`iris mcp [--chrome <PATH>]` serves the single-image `capture` tool over stdio. Batch capture, browser interaction scripting, diffs, and review workflows remain outside Iris.
+Capture reports include the final URL, title, document dimensions, pending or failed images, font readiness, active animations, stage timings, and warnings.
+
+A completed image is not proof that every page asset loaded. An explicit `wait_for` or `wait_ms` can help with app-specific readiness.
+
+Timings cover the active capture. MCP queueing and cold browser startup are outside `timings.total_ms`, but inside `timeout_seconds`.
+
+Cancelling an MCP request stops queued work and in-progress captures. Comparisons check for cancellation between decoding steps and rows. A file write that has already started may finish.
+
+`freeze_animations` changes the state being photographed: finite animations finish and repeating animations pause. Use it for stable layout inspection, not for checking motion. Canvas, video, and JavaScript timers are not frozen.
+
+A pixel budget too small to retain at least one pixel on each axis returns an error.
+
+## Compare saved captures
+
+`iris compare before.png after.png --threshold 8 -o diff.png` prints a JSON report. A pixel changes when its largest channel difference exceeds the threshold. Transparent pixels are composited on white.
+
+Different dimensions are compared on the union canvas without rescaling. Pixels present in only one image count as changed. The optional PNG marks changed pixels red.
+
+Comparison errors exit nonzero. A nonzero change count is a result, not a command failure.
 
 ## License
 

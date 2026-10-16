@@ -1,0 +1,29 @@
+id: anti-slop-rust-require-safety-comment-for-unsafe
+language: rust
+severity: error
+message: This `unsafe` block has no `// SAFETY:` justification directly above it.
+note: |
+  State the invariant the compiler cannot check immediately before the block
+  (`// SAFETY: <why this upholds the contract>`), the same way a TypeScript
+  type assertion needs a `SAFETY:` comment to explain what the checker can't see.
+rule:
+  any:
+    - all:
+        - kind: expression_statement
+        - has:
+            kind: unsafe_block
+        - not:
+            follows:
+              kind: line_comment
+              stopBy: neighbor
+              regex: 'SAFETY\s*:'
+    - all:
+        - kind: let_declaration
+        - has:
+            field: value
+            kind: unsafe_block
+        - not:
+            follows:
+              kind: line_comment
+              stopBy: neighbor
+              regex: 'SAFETY\s*:'

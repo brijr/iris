@@ -1,0 +1,65 @@
+id: anti-slop-rust-no-unchecked-unwrap
+language: rust
+severity: error
+message: This `.unwrap()`/`.expect(..)` has no justification for why it cannot panic.
+note: |
+  State why the panic path is impossible or acceptable with a `// SAFETY:`
+  (invariant holds) or `// PANIC:` (crash is the intended behavior) comment
+  directly above the statement. Otherwise propagate the error with `?`.
+rule:
+  any:
+    - all:
+        - kind: let_declaration
+        - has: &unwrap_or_expect_call
+            stopBy: end
+            kind: call_expression
+            has:
+              field: function
+              kind: field_expression
+              has:
+                field: field
+                regex: '^(unwrap|expect)$'
+        - not: &has_safety_or_panic_comment
+            follows:
+              kind: line_comment
+              stopBy: neighbor
+              regex: '(SAFETY|PANIC)\s*:'
+        - not: &inside_test_code
+            inside:
+              stopBy: end
+              any:
+                - all:
+                    - kind: function_item
+                    - follows:
+                        kind: attribute_item
+                        stopBy: neighbor
+                        has:
+                          kind: attribute
+                          has:
+                            kind: identifier
+                            regex: '^test$'
+                - all:
+                    - kind: mod_item
+                    - follows:
+                        kind: attribute_item
+                        stopBy: neighbor
+                        has:
+                          kind: attribute
+                          regex: 'cfg\s*\(\s*test\s*\)'
+    - all:
+        - kind: call_expression
+        - inside:
+            kind: block
+        - has:
+            field: function
+            kind: field_expression
+            has:
+              field: field
+              regex: '^(unwrap|expect)$'
+        - not: *has_safety_or_panic_comment
+        - not: *inside_test_code
+    - all:
+        - kind: expression_statement
+        - has: *unwrap_or_expect_call
+        - not: *has_safety_or_panic_comment
+        - not: *inside_test_code

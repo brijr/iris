@@ -1,0 +1,16 @@
+id: anti-slop-rust-no-dyn-any
+language: rust
+severity: error
+message: Do not erase types behind `dyn Any` or downcast out of it.
+note: |
+  `dyn Any` throws away the type system the same way `unknown` does in TypeScript.
+  Give the value a real enum or trait with the methods callers need instead of
+  boxing it as `Any` and downcasting at every call site.
+rule:
+  any:
+    - pattern:
+        context: "fn f(x: Box<dyn Any>) {}"
+        selector: dynamic_type
+    - pattern: $X.downcast_ref::<$T>()
+    - pattern: $X.downcast::<$T>()
+    - pattern: $X.downcast_mut::<$T>()

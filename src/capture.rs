@@ -1,22 +1,26 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::emulation::{
     MediaFeature, SetDeviceMetricsOverrideParams, SetEmulatedMediaParams,
     SetUserAgentOverrideParams,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, Viewport as ScreenshotViewport,
+    CaptureScreenshotFormat, CaptureScreenshotParams, Viewport as ScreenshotViewport,
 };
+use chromiumoxide::cdp::browser_protocol::target::CreateTargetParams;
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
-use chromiumoxide::page::{Page, ScreenshotParams};
+use chromiumoxide::page::Page;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use num_traits::ToPrimitive;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::task::JoinHandle;
 use url::Url;
 
@@ -147,17 +151,42 @@ pub struct Opts {
     pub wait_for: Option<String>,
     pub timeout: Duration,
     pub format: Format,
+    pub quality: u8,
+    pub max_pixels: Option<u64>,
+    pub freeze_animations: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Timings {
+    pub setup_ms: u64,
+    pub navigation_ms: u64,
+    pub ready_ms: u64,
+    pub screenshot_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PageInfo {
+    pub final_url: String,
+    pub title: String,
+    pub document_width: u32,
+    pub document_height: u32,
+    pub pending_images: u32,
+    pub failed_images: u32,
+    pub fonts_pending: bool,
+    pub running_animations: u32,
 }
 
 #[derive(Debug)]
 pub struct Shot {
-    /// Captured width and height in CSS pixels.
+    /// Capture rectangle in CSS pixels; scale records the actual image density.
     pub width: u32,
     pub height: u32,
-    /// Device scale factor actually used (full-page shots too tall for Chrome's
-    /// ~16k texture limit fall back to 1x).
     pub scale: f64,
     pub bytes: u64,
+    pub page: PageInfo,
+    pub timings: Timings,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -176,6 +205,9 @@ pub struct SuccessReport {
     scale: f64,
     format: &'static str,
     bytes: u64,
+    page: PageInfo,
+    timings: Timings,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -211,6 +243,9 @@ pub fn success_report(
         scale: shot.scale,
         format: format.ext(),
         bytes: shot.bytes,
+        page: shot.page.clone(),
+        timings: shot.timings.clone(),
+        warnings: shot.warnings.clone(),
     }
 }
 
@@ -241,17 +276,24 @@ pub fn absolute_output(path: &Path) -> String {
 #[derive(Debug)]
 pub struct CapturedImage {
     pub shot: Shot,
-    pub data: Vec<u8>,
+    /// Keep Chrome's encoded bytes for MCP instead of decoding and encoding again.
+    pub data: String,
 }
 
 impl CapturedImage {
+    pub fn pixels(&self) -> Result<Vec<u8>> {
+        BASE64
+            .decode(&self.data)
+            .context("Chrome returned invalid image data")
+    }
+
     pub async fn write_to(&self, out: &Path) -> Result<()> {
         if let Some(parent) = out.parent().filter(|path| !path.as_os_str().is_empty()) {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        tokio::fs::write(out, &self.data)
+        tokio::fs::write(out, self.pixels()?)
             .await
             .with_context(|| format!("failed to write {}", out.display()))
     }
@@ -285,6 +327,39 @@ pub struct Session {
     user_agent: Option<String>,
 }
 
+struct CaptureTab {
+    page: Page,
+    closing: bool,
+}
+
+impl CaptureTab {
+    async fn close(mut self) {
+        let result = tokio::time::timeout(Duration::from_secs(2), self.page.clone().close()).await;
+        self.closing = matches!(result, Ok(Ok(_)));
+    }
+}
+
+impl Drop for CaptureTab {
+    fn drop(&mut self) {
+        if !self.closing {
+            let page = self.page.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(2), page.close()).await;
+            });
+        }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.handler.abort();
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 impl Session {
     pub async fn launch(chrome: Option<PathBuf>, viewport: Viewport) -> Result<Self> {
         let profile_dir = ProfileDir::unique();
@@ -294,10 +369,12 @@ impl Session {
         if let Some(path) = chrome.or_else(find_chrome) {
             config = config.chrome_executable(path);
         }
-        let config = config.build().map_err(|e| anyhow!(e))?;
+        let config = config
+            .build()
+            .map_err(|e| anyhow!("{e}: set CHROME=/path/to/browser or pass --chrome"))?;
         let (browser, mut handler) = Browser::launch(config)
             .await
-            .context("failed to launch Chrome (install Google Chrome or pass --chrome)")?;
+            .context("failed to launch Chrome (install a Chrome-family browser, set CHROME, or pass --chrome)")?;
         // Newer Chrome versions emit CDP messages chromiumoxide can't deserialize
         // (Serde errors) — harmless, keep pumping. Transport errors mean the
         // connection is gone, so stop.
@@ -323,14 +400,27 @@ impl Session {
     }
 
     pub async fn capture(&self, url: &str, opts: &Opts) -> Result<CapturedImage> {
-        let page = tokio::time::timeout(opts.timeout, self.browser.new_page("about:blank"))
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + opts.timeout;
+        // Background tabs can stop producing the rendered frames these captures await.
+        let target = CreateTargetParams::builder()
+            .url("about:blank")
+            .new_window(true)
+            .build()
+            .map_err(|error| anyhow!(error))?;
+        let page = tokio::time::timeout_at(deadline, self.browser.new_page(target))
             .await
             .map_err(|_| anyhow!("timed out opening a tab"))??;
-        let result = tokio::time::timeout(opts.timeout, self.pipeline(&page, url, opts))
-            .await
-            .map_err(|_| anyhow!("timed out after {}s", opts.timeout.as_secs()))
-            .and_then(|r| r);
-        let _ = page.close().await;
+        let tab = CaptureTab {
+            page,
+            closing: false,
+        };
+        let result =
+            tokio::time::timeout_at(deadline, self.pipeline(&tab.page, url, opts, started))
+                .await
+                .map_err(|_| anyhow!("capture timed out after {}s", opts.timeout.as_secs()))
+                .and_then(|result| result);
+        tab.close().await;
         result
     }
 
@@ -338,35 +428,31 @@ impl Session {
         !self.handler.is_finished()
     }
 
-    async fn pipeline(&self, page: &Page, url: &str, opts: &Opts) -> Result<CapturedImage> {
-        let started = std::time::Instant::now();
+    async fn pipeline(
+        &self,
+        page: &Page,
+        url: &str,
+        opts: &Opts,
+        started: Instant,
+    ) -> Result<CapturedImage> {
         let v = opts.viewport;
-        page.execute(
-            SetDeviceMetricsOverrideParams::builder()
-                .width(v.width as i64)
-                .height(v.height as i64)
-                .device_scale_factor(v.scale)
-                .mobile(v.mobile)
-                .build()
-                .map_err(|e| anyhow!(e))?,
-        )
+        page.execute(SetDeviceMetricsOverrideParams::new(
+            i64::from(v.width),
+            i64::from(v.height),
+            v.scale,
+            v.mobile,
+        ))
         .await?;
 
-        let ua = if v.mobile {
-            Some(IPHONE_UA.to_string())
+        let user_agent = if v.mobile {
+            Some(IPHONE_UA)
         } else {
-            self.user_agent.clone()
+            self.user_agent.as_deref()
         };
-        if let Some(ua) = ua {
-            page.execute(
-                SetUserAgentOverrideParams::builder()
-                    .user_agent(ua)
-                    .build()
-                    .map_err(|e| anyhow!(e))?,
-            )
-            .await?;
+        if let Some(user_agent) = user_agent {
+            page.execute(SetUserAgentOverrideParams::new(user_agent))
+                .await?;
         }
-
         if opts.dark {
             page.execute(
                 SetEmulatedMediaParams::builder()
@@ -378,169 +464,178 @@ impl Session {
             )
             .await?;
         }
+        let mut timings = Timings {
+            setup_ms: elapsed_ms(started),
+            ..Timings::default()
+        };
+        let navigation = Instant::now();
+        page.goto(url).await.context("navigation failed")?;
+        timings.navigation_ms = elapsed_ms(navigation);
 
-        page.goto(url).await?;
-        page.wait_for_navigation().await?;
-
-        self.eval(page, SETTLE_JS.into()).await?;
+        let ready = Instant::now();
+        let remaining_ms = || {
+            u64::try_from(
+                opts.timeout
+                    .saturating_sub(started.elapsed())
+                    .saturating_sub(Duration::from_millis(500))
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        };
         if let Some(selector) = &opts.wait_for {
-            // Undercut the outer timeout so the descriptive selector error surfaces
-            // instead of a generic "timed out".
-            let budget = opts
-                .timeout
-                .saturating_sub(started.elapsed())
-                .saturating_sub(Duration::from_millis(500));
-            self.eval(page, wait_for_js(selector, budget.as_millis() as u64))
+            self.eval::<()>(page, wait_for_js(selector, remaining_ms())?)
                 .await?;
         }
         match &opts.mode {
             CaptureMode::Viewport => {}
-            CaptureMode::FullPage => {
-                self.eval(page, SCROLL_JS.into()).await?;
-            }
+            CaptureMode::FullPage => self.eval::<()>(page, SCROLL_JS.into()).await?,
             CaptureMode::Element { selector, .. } => {
-                let budget = opts
-                    .timeout
-                    .saturating_sub(started.elapsed())
-                    .saturating_sub(Duration::from_millis(500));
-                self.eval(
-                    page,
-                    wait_and_scroll_js(selector, budget.as_millis() as u64),
-                )
-                .await?;
-                // Scrolling can start image loads, IntersectionObservers, and
-                // entrance transitions that the initial settle could not see.
-                self.eval(page, SETTLE_JS.into()).await?;
+                self.eval::<()>(page, wait_and_scroll_js(selector, remaining_ms())?)
+                    .await?;
             }
         }
         if opts.wait_ms > 0 {
             tokio::time::sleep(Duration::from_millis(opts.wait_ms)).await;
-            self.eval(page, SETTLE_JS.into()).await?;
         }
-
-        let screenshot_params = || {
-            let mut params = ScreenshotParams::builder().format(opts.format.cdp());
-            if opts.format != Format::Png {
-                params = params.quality(90);
-            }
-            params
-        };
-
-        let (width, height, scale, data) = match &opts.mode {
-            CaptureMode::Viewport => (
-                v.width,
-                v.height,
-                v.scale,
-                page.screenshot(screenshot_params().build()).await?,
+        self.eval::<()>(
+            page,
+            format!(
+                "({SETTLE_JS})({}, {})",
+                matches!(opts.mode, CaptureMode::FullPage),
+                opts.freeze_animations
             ),
-            CaptureMode::FullPage => {
-                let doc_h = self
-                    .eval_u32(page, DOC_HEIGHT_JS)
-                    .await
-                    .unwrap_or(v.height)
-                    .max(v.height);
-                if doc_h as f64 * v.scale <= 16_000.0 {
-                    // Retina full page: grow the viewport to the whole document so the
-                    // scale factor still applies (CDP's captureBeyondViewport renders at 1x).
-                    page.execute(
-                        SetDeviceMetricsOverrideParams::builder()
-                            .width(v.width as i64)
-                            .height(doc_h as i64)
-                            .device_scale_factor(v.scale)
-                            .mobile(v.mobile)
-                            .build()
-                            .map_err(|e| anyhow!(e))?,
-                    )
+        )
+        .await?;
+        let info: PageInfo = self.eval(page, PAGE_INFO_JS.into()).await?;
+        timings.ready_ms = elapsed_ms(ready);
+
+        let clip = match &opts.mode {
+            CaptureMode::Viewport => {
+                let (x, y): (f64, f64) = self
+                    .eval(page, "[window.scrollX, window.scrollY]".into())
                     .await?;
-                    self.eval(page, SETTLE_JS.into()).await?;
-                    (
-                        v.width,
-                        doc_h,
-                        v.scale,
-                        page.screenshot(screenshot_params().build()).await?,
-                    )
-                } else {
-                    (
-                        v.width,
-                        doc_h,
-                        1.0,
-                        page.screenshot(screenshot_params().full_page(true).build())
-                            .await?,
-                    )
+                ClipRect {
+                    x,
+                    y,
+                    width: f64::from(v.width),
+                    height: f64::from(v.height),
                 }
             }
+            CaptureMode::FullPage => ClipRect {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(info.document_width.max(v.width)),
+                height: f64::from(info.document_height.max(v.height)),
+            },
             CaptureMode::Element { selector, padding } => {
-                let value = self.eval(page, element_bounds_js(selector)).await?;
-                let bounds: ElementBounds = serde_json::from_value(value)
-                    .context("failed to read selected element bounds")?;
-                let clip = round_clip(&bounds, *padding)
-                    .with_context(|| format!("cannot capture selected element: {selector}"))?;
-                let cdp_clip = ScreenshotViewport::builder()
-                    .x(clip.x)
-                    .y(clip.y)
-                    .width(clip.width)
-                    .height(clip.height)
-                    .scale(1.0)
-                    .build()
-                    .map_err(|e| anyhow!(e))?;
-                (
-                    clip.width as u32,
-                    clip.height as u32,
-                    v.scale,
-                    page.screenshot(
-                        screenshot_params()
-                            .clip(cdp_clip)
-                            .capture_beyond_viewport(true)
-                            .build(),
-                    )
-                    .await?,
-                )
+                let bounds: ElementBounds = self.eval(page, element_bounds_js(selector)?).await?;
+                round_clip(&bounds, *padding)
+                    .with_context(|| format!("cannot capture selected element: {selector}"))?
             }
         };
-
-        let bytes = data.len() as u64;
+        let mut scale = v.scale;
+        if let Some(max_pixels) = opts.max_pixels {
+            scale = scale.min(
+                (max_pixels
+                    .to_f64()
+                    .context("pixel budget is out of range")?
+                    / (clip.width * clip.height))
+                    .sqrt(),
+            );
+            scale = ((clip.width * scale).floor() / clip.width)
+                .min((clip.height * scale).floor() / clip.height);
+            if scale <= 0.0 {
+                bail!("pixel budget is too small for this capture's aspect ratio");
+            }
+        } else if matches!(opts.mode, CaptureMode::FullPage) && clip.height * scale > 16_000.0 {
+            // Past Chrome's ~16k px render limit, full pages fall back to 1x.
+            scale = 1.0;
+        }
+        let capture_started = Instant::now();
+        let mut params = CaptureScreenshotParams::builder()
+            .format(opts.format.cdp())
+            .from_surface(true)
+            .capture_beyond_viewport(true)
+            .clip(ScreenshotViewport {
+                x: clip.x,
+                y: clip.y,
+                width: clip.width,
+                height: clip.height,
+                scale: scale / v.scale,
+            });
+        if opts.format != Format::Png {
+            params = params.quality(i64::from(opts.quality));
+        }
+        let data: String = page
+            .execute(params.build())
+            .await
+            .context("screenshot failed")?
+            .result
+            .data
+            .into();
+        timings.screenshot_ms = elapsed_ms(capture_started);
+        timings.total_ms = elapsed_ms(started);
+        let padding = data
+            .as_bytes()
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'=')
+            .count();
+        let bytes = u64::try_from(data.len() / 4 * 3 - padding)?;
+        let mut warnings = Vec::new();
+        if info.pending_images > 0 {
+            warnings.push(format!("{} images were still loading", info.pending_images));
+        }
+        if info.failed_images > 0 {
+            warnings.push(format!("{} images failed to load", info.failed_images));
+        }
+        if info.fonts_pending {
+            warnings.push("fonts were still loading".into());
+        }
+        if info.running_animations > 0 {
+            warnings.push(format!(
+                "{} animations were still running",
+                info.running_animations
+            ));
+        }
         Ok(CapturedImage {
             shot: Shot {
-                width,
-                height,
+                width: clip
+                    .width
+                    .to_u32()
+                    .context("capture width is out of range")?,
+                height: clip
+                    .height
+                    .to_u32()
+                    .context("capture height is out of range")?,
                 scale,
                 bytes,
+                page: info,
+                timings,
+                warnings,
             },
             data,
         })
     }
 
     /// Run a JS expression (promises awaited); surface page-side exceptions as errors.
-    async fn eval(&self, page: &Page, js: String) -> Result<serde_json::Value> {
+    async fn eval<T: DeserializeOwned>(&self, page: &Page, js: String) -> Result<T> {
         let params = EvaluateParams::builder()
             .expression(js)
             .await_promise(true)
             .return_by_value(true)
             .build()
-            .map_err(|e| anyhow!(e))?;
-        let resp = page.execute(params).await?;
-        if let Some(details) = &resp.result.exception_details {
-            let msg = details
+            .map_err(|error| anyhow!(error))?;
+        let response = page.execute(params).await?.result;
+        if let Some(details) = response.exception_details {
+            let message = details
                 .exception
-                .as_ref()
-                .and_then(|e| e.description.clone())
-                .unwrap_or_else(|| details.text.clone());
-            bail!("{}", msg.lines().next().unwrap_or("page script failed"));
+                .and_then(|exception| exception.description)
+                .unwrap_or(details.text);
+            bail!("{}", message.lines().next().unwrap_or("page script failed"));
         }
-        Ok(resp
-            .result
-            .result
-            .value
-            .clone()
-            .unwrap_or(serde_json::Value::Null))
-    }
-
-    async fn eval_u32(&self, page: &Page, js: &str) -> Result<u32> {
-        let value = self.eval(page, js.into()).await?;
-        value
-            .as_f64()
-            .map(|n| n as u32)
-            .ok_or_else(|| anyhow!("expected a number from page"))
+        serde_json::from_value(response.result.value.unwrap_or(serde_json::Value::Null))
+            .context("unexpected response from capture script")
     }
 
     pub async fn close(mut self) {
@@ -552,8 +647,51 @@ impl Session {
             let _ = self.browser.kill().await;
         }
         self.handler.abort();
+        reap_profile_processes(self.profile_dir.path()).await;
         let _ = tokio::fs::remove_dir_all(self.profile_dir.path()).await;
     }
+}
+
+/// Chromium helpers can outlive the browser: Helium leaves its network
+/// service running, reparented to launchd. Stop every process still started
+/// with this session's profile, politely first.
+async fn reap_profile_processes(profile: &Path) {
+    let marker = format!("--user-data-dir={}", profile.display());
+    for signal in ["-TERM", "-KILL"] {
+        let table = process_table();
+        let pids = profile_pids(&table, &marker);
+        if pids.is_empty() {
+            return;
+        }
+        let _ = std::process::Command::new("kill")
+            .arg(signal)
+            .args(&pids)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !profile_pids(&process_table(), &marker).is_empty() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn process_table() -> String {
+    std::process::Command::new("ps")
+        .args(["axww", "-o", "pid=,command="])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// PIDs whose command line names exactly `marker` as an argument, so the
+/// profile `...-1` never matches a sibling session's `...-10`.
+fn profile_pids<'a>(table: &'a str, marker: &str) -> Vec<&'a str> {
+    table
+        .lines()
+        .filter(|line| line.split_whitespace().any(|arg| arg == marker))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect()
 }
 
 pub fn parse_viewport(size: &str, scale: Option<f64>) -> Result<Viewport> {
@@ -622,6 +760,7 @@ fn find_chrome() -> Option<PathBuf> {
         "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
         "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
         "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Helium.app/Contents/MacOS/Helium",
     ];
     #[cfg(windows)]
     const CANDIDATES: &[&str] = &[
@@ -638,62 +777,72 @@ fn find_chrome() -> Option<PathBuf> {
     CANDIDATES.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-/// Fonts loaded, near-viewport images loaded (3s cap each), two frames painted,
-/// then any running finite animations/transitions — entrance fade-ins — allowed
-/// to finish (3s cap; infinite loops are skipped, they never settle). Off-screen
-/// images are ignored: they don't appear in the capture, and lazy-loaded ones
-/// would stall the wait forever. Full-page captures grow the viewport to the
-/// whole document before the final settle, so everything counts as near there.
-const SETTLE_JS: &str = r#"(async () => {
-  if (document.fonts) { try { await document.fonts.ready; } catch {} }
-  const near = (img) => {
-    const r = img.getBoundingClientRect();
-    return r.top < innerHeight * 1.5 && r.bottom > -innerHeight * 0.5;
-  };
-  await Promise.all(Array.from(document.images)
-    .filter(img => !img.complete && near(img))
-    .map(img => new Promise(r => {
-      img.addEventListener('load', r, { once: true });
-      img.addEventListener('error', r, { once: true });
-      setTimeout(r, 3000);
-    })));
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-  const finite = document.getAnimations().filter(a => {
+/// Wait once, after scrolling. Asset and finite-animation waits share the same cap.
+const SETTLE_JS: &str = r#"async (fullPage, freeze) => {
+  const deadline = performance.now() + 3000;
+  const bounded = async (promise) => {
+    let timer;
     try {
-      return a.playState === 'running' && a.effect.getTiming().iterations !== Infinity;
-    } catch { return false; }
-  });
-  await Promise.race([
-    Promise.all(finite.map(a => a.finished.catch(() => {}))),
-    new Promise(r => setTimeout(r, 3000)),
-  ]);
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-})()"#;
-
-/// Step-scroll to the bottom so IntersectionObserver lazy-loading fires, then back to top.
-const SCROLL_JS: &str = r#"(async () => {
-  const height = () => Math.max(
-    document.body?.scrollHeight ?? 0,
-    document.documentElement.scrollHeight
-  );
-  const step = Math.max(200, window.innerHeight);
-  for (let y = 0, guard = 0; y < height() && guard < 500; y += step, guard++) {
-    window.scrollTo(0, y);
-    await new Promise(r => setTimeout(r, 60));
+      await Promise.race([promise, new Promise(resolve => {
+        timer = setTimeout(resolve, Math.max(0, deadline - performance.now()));
+      })]);
+    } finally { clearTimeout(timer); }
+  };
+  const frames = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const near = img => {
+    const rect = img.getBoundingClientRect();
+    return fullPage || (rect.top < innerHeight * 1.5 && rect.bottom > -innerHeight * 0.5);
+  };
+  const images = Array.from(document.images).filter(img => !img.complete && near(img));
+  await bounded(Promise.all([
+    document.fonts?.ready,
+    ...images.map(img => new Promise(resolve => {
+      img.addEventListener('load', resolve, { once: true });
+      img.addEventListener('error', resolve, { once: true });
+    })),
+  ]));
+  await frames();
+  const animations = document.getAnimations().filter(animation => animation.playState === 'running');
+  if (freeze) {
+    for (const animation of animations) {
+      try {
+        if (animation.effect?.getComputedTiming().endTime !== Infinity) animation.finish();
+        else animation.pause();
+      } catch { animation.pause(); }
+    }
+  } else {
+    const finite = animations.filter(animation => animation.effect?.getComputedTiming().endTime !== Infinity);
+    await bounded(Promise.all(finite.map(animation => animation.finished.catch(() => {}))));
   }
-  window.scrollTo(0, 0);
-  await new Promise(r => setTimeout(r, 150));
-  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  await frames();
+}"#;
+
+/// Preserve the requested viewport while triggering intersection-based lazy loading.
+const SCROLL_JS: &str = r#"(async () => {
+  const height = () => Math.max(document.body?.scrollHeight ?? 0, document.documentElement.scrollHeight);
+  const step = Math.max(200, innerHeight * 0.9);
+  for (let y = 0, steps = 0; y < height() && steps < 500; y += step, steps++) {
+    scrollTo(0, y);
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+  scrollTo(0, 0);
+  await new Promise(resolve => requestAnimationFrame(resolve));
 })()"#;
 
-const DOC_HEIGHT_JS: &str = r#"Math.max(
-  document.body?.scrollHeight ?? 0,
-  document.documentElement.scrollHeight
-)"#;
+const PAGE_INFO_JS: &str = r#"(() => ({
+  final_url: location.href,
+  title: document.title,
+  document_width: Math.max(document.body?.scrollWidth ?? 0, document.documentElement.scrollWidth, innerWidth),
+  document_height: Math.max(document.body?.scrollHeight ?? 0, document.documentElement.scrollHeight, innerHeight),
+  pending_images: Array.from(document.images).filter(image => !image.complete).length,
+  failed_images: Array.from(document.images).filter(image => image.complete && image.currentSrc && !image.naturalWidth).length,
+  fonts_pending: document.fonts?.status === 'loading',
+  running_animations: document.getAnimations().filter(animation => animation.playState === 'running').length,
+}))()"#;
 
-fn wait_for_js(selector: &str, budget_ms: u64) -> String {
-    let selector = serde_json::to_string(selector).expect("selector is serializable");
-    format!(
+fn wait_for_js(selector: &str, budget_ms: u64) -> Result<String> {
+    let selector = serde_json::to_string(selector)?;
+    Ok(format!(
         r#"(async () => {{
   const deadline = Date.now() + {budget_ms};
   const selector = {selector};
@@ -706,12 +855,12 @@ fn wait_for_js(selector: &str, budget_ms: u64) -> String {
     await new Promise(r => setTimeout(r, 100));
   }}
 }})()"#
-    )
+    ))
 }
 
-fn wait_and_scroll_js(selector: &str, budget_ms: u64) -> String {
-    let selector = serde_json::to_string(selector).expect("selector is serializable");
-    format!(
+fn wait_and_scroll_js(selector: &str, budget_ms: u64) -> Result<String> {
+    let selector = serde_json::to_string(selector)?;
+    Ok(format!(
         r#"(async () => {{
   const deadline = Date.now() + {budget_ms};
   const selector = {selector};
@@ -727,12 +876,12 @@ fn wait_and_scroll_js(selector: &str, budget_ms: u64) -> String {
   element.scrollIntoView({{ block: "center", inline: "center" }});
   await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 }})()"#
-    )
+    ))
 }
 
-fn element_bounds_js(selector: &str) -> String {
-    let selector = serde_json::to_string(selector).expect("selector is serializable");
-    format!(
+fn element_bounds_js(selector: &str) -> Result<String> {
+    let selector = serde_json::to_string(selector)?;
+    Ok(format!(
         r#"(() => {{
   const selector = {selector};
   let element;
@@ -761,11 +910,11 @@ fn element_bounds_js(selector: &str) -> String {
     )
   }};
 }})()"#
-    )
+    ))
 }
 
 fn round_clip(bounds: &ElementBounds, padding: u32) -> Result<ClipRect> {
-    let padding = padding as f64;
+    let padding = f64::from(padding);
     let left = (bounds.x - padding).floor().clamp(0.0, bounds.doc_width);
     let top = (bounds.y - padding).floor().clamp(0.0, bounds.doc_height);
     let right = (bounds.x + bounds.width + padding)
@@ -793,6 +942,20 @@ fn round_clip(bounds: &ElementBounds, padding: u32) -> Result<ClipRect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_pids_match_the_whole_profile_argument() {
+        let table = concat!(
+            "  101 /Apps/Helium --user-data-dir=/tmp/iris-chrome-7-1 --headless\n",
+            "  102 /Apps/Helium Helper --type=utility --user-data-dir=/tmp/iris-chrome-7-10\n",
+            "  103 /Apps/Helium Helper --type=renderer --user-data-dir=/tmp/iris-chrome-7-1\n",
+        );
+
+        assert_eq!(
+            profile_pids(table, "--user-data-dir=/tmp/iris-chrome-7-1"),
+            ["101", "103"]
+        );
+    }
 
     #[test]
     fn clip_rounds_outward_and_applies_padding() {
@@ -899,7 +1062,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_page_capture_keeps_viewport_relative_heights() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/full-page-layout.html")
+            .canonicalize()?;
+        let url = Url::from_file_path(fixture).map_err(|_| anyhow!("invalid fixture URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::FullPage, false),
+            )
+            .await;
+        session.close().await;
+        let capture = capture?;
+
+        // A 100vh header, 900px main, and 100px footer make a 1240px page.
+        assert_eq!(
+            (capture.shot.width, capture.shot.height, capture.shot.scale),
+            (320, 1240, 2.0)
+        );
+        let image = image::load_from_memory(&capture.pixels()?)?.to_rgb8();
+        assert_eq!(image.dimensions(), (640, 2480));
+        // The header stays one viewport (240px, 480 device pixels) tall.
+        assert_eq!(image.get_pixel(320, 479).0, [22, 78, 154]);
+        assert_eq!(image.get_pixel(320, 480).0, [233, 138, 34]);
+        assert_eq!(image.get_pixel(320, 2479).0, [39, 133, 74]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_page_capture_past_the_render_limit_falls_back_to_1x() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let url =
+            "data:text/html,<style>html,body{margin:0}main{height:9000px}</style><main></main>";
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(url, &page_opts(viewport, CaptureMode::FullPage, false))
+            .await;
+        session.close().await;
+        let capture = capture?;
+
+        // 9000 CSS px at 2x would be 18,000 device px.
+        assert_eq!(capture.shot.scale, 1.0);
+        let image = image::load_from_memory(&capture.pixels()?)?.to_rgb8();
+        assert_eq!(image.dimensions(), (320, 9000));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_page_pixel_budget_preserves_viewport_relative_layout() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/full-page-layout.html")
+            .canonicalize()?;
+        let url = Url::from_file_path(fixture).map_err(|_| anyhow!("invalid fixture URL"))?;
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 2.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let mut opts = page_opts(viewport, CaptureMode::FullPage, false);
+        opts.max_pixels = Some(100_000);
+        let capture = session.capture(url.as_str(), &opts).await;
+        session.close().await;
+        let image = image::load_from_memory(&capture?.pixels()?)?.to_rgb8();
+        assert_eq!(image.dimensions(), (160, 620));
+        assert_eq!(image.get_pixel(80, 119).0, [22, 78, 154]);
+        assert_eq!(image.get_pixel(80, 120).0, [233, 138, 34]);
+        assert_eq!(image.get_pixel(80, 619).0, [39, 133, 74]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn viewport_capture_preserves_fragment_scroll_position() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/full-page-layout.html")
+            .canonicalize()?;
+        let mut url = Url::from_file_path(fixture).map_err(|_| anyhow!("invalid fixture URL"))?;
+        url.set_fragment(Some("totals"));
+        let viewport = Viewport {
+            width: 320,
+            height: 240,
+            scale: 1.0,
+            mobile: false,
+        };
+        let session = Session::launch(None, viewport).await?;
+        let capture = session
+            .capture(
+                url.as_str(),
+                &page_opts(viewport, CaptureMode::Viewport, false),
+            )
+            .await;
+        session.close().await;
+        let image = image::load_from_memory(&capture?.pixels()?)?.to_rgb8();
+        assert_eq!(image.get_pixel(160, 0).0, [233, 138, 34]);
+        assert_eq!(image.get_pixel(160, 239).0, [39, 133, 74]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn browser_element_capture_contract() -> Result<()> {
+        let _browser_guard = crate::BROWSER_TEST_LOCK.lock().await;
         let temp = std::env::temp_dir().join(format!("iris-browser-{}", std::process::id()));
         tokio::fs::create_dir_all(&temp).await?;
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -983,7 +1263,7 @@ mod tests {
             (dark_viewport.shot.width, dark_viewport.shot.height),
             (320, 240)
         );
-        assert_eq!(png_dimensions(&dark_viewport.data), (320, 240));
+        assert_eq!(png_dimensions(&dark_viewport.pixels()?), (320, 240));
 
         let full_page = session
             .capture(
@@ -994,7 +1274,7 @@ mod tests {
         assert_eq!(full_page.shot.width, 320);
         assert!(full_page.shot.height > viewport.height);
         assert_eq!(
-            png_dimensions(&full_page.data),
+            png_dimensions(&full_page.pixels()?),
             (full_page.shot.width, full_page.shot.height)
         );
 
@@ -1011,7 +1291,7 @@ mod tests {
             )
             .await?;
         assert_eq!((mobile.shot.width, mobile.shot.height), (390, 844));
-        assert_eq!(png_dimensions(&mobile.data), (390, 844));
+        assert_eq!(png_dimensions(&mobile.pixels()?), (390, 844));
 
         let invalid = session
             .capture(url.as_str(), &element_opts(viewport, "[", 0, Format::Png))
@@ -1021,11 +1301,10 @@ mod tests {
 
         let mut missing_url = url.clone();
         missing_url.set_query(Some("missing=1"));
+        let mut missing_opts = element_opts(viewport, ".capture-target", 0, Format::Png);
+        missing_opts.timeout = Duration::from_secs(3);
         let missing = session
-            .capture(
-                missing_url.as_str(),
-                &element_opts(viewport, ".capture-target", 0, Format::Png),
-            )
+            .capture(missing_url.as_str(), &missing_opts)
             .await
             .unwrap_err();
         assert!(format!("{missing:#}").contains("selector never appeared: .capture-target"));
@@ -1054,8 +1333,11 @@ mod tests {
             dark: false,
             wait_ms: 0,
             wait_for: None,
-            timeout: Duration::from_secs(3),
+            timeout: Duration::from_secs(30),
             format,
+            quality: 90,
+            max_pixels: None,
+            freeze_animations: false,
         }
     }
 
@@ -1066,13 +1348,19 @@ mod tests {
             dark,
             wait_ms: 0,
             wait_for: None,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(30),
             format: Format::Png,
+            quality: 90,
+            max_pixels: None,
+            freeze_animations: false,
         }
     }
 
     async fn capture_to(session: &Session, url: &str, path: &Path, opts: &Opts) -> Result<Shot> {
-        let image = session.capture(url, opts).await?;
+        let image = session
+            .capture(url, opts)
+            .await
+            .with_context(|| format!("capture failed: {}", path.display()))?;
         image.write_to(path).await?;
         Ok(image.shot)
     }

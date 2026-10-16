@@ -1,0 +1,14 @@
+id: anti-slop-rust-no-numeric-as-cast
+language: rust
+severity: error
+message: Do not use `as` to cast between numeric types; it truncates silently.
+note: |
+  `as` between numeric types wraps or truncates without telling you. Use
+  `TryFrom`/`try_into` and handle the error, or a checked/saturating
+  conversion when truncation is genuinely intended and say so.
+rule:
+  kind: type_cast_expression
+  has:
+    field: type
+    kind: primitive_type
+    regex: '^(u8|u16|u32|u64|u128|usize|i8|i16|i32|i64|i128|isize|f32|f64)$'

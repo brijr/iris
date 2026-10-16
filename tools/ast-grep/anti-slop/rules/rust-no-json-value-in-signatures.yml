@@ -1,0 +1,26 @@
+id: anti-slop-rust-no-json-value-in-signatures
+language: rust
+severity: error
+message: Do not accept or return `serde_json::Value` at a function boundary.
+note: |
+  `Value` at a signature is the same untyped hole as TypeScript's `unknown`
+  parameter or return type. Parse into a concrete struct at the boundary
+  (`#[derive(Deserialize)]`) and keep `Value` internal, if used at all.
+rule:
+  any:
+    - all:
+        - any:
+            - kind: type_identifier
+            - kind: scoped_type_identifier
+        - regex: '(^|::)Value$'
+        - inside:
+            kind: parameter
+            field: type
+    - all:
+        - any:
+            - kind: type_identifier
+            - kind: scoped_type_identifier
+        - regex: '(^|::)Value$'
+        - inside:
+            kind: function_item
+            field: return_type
